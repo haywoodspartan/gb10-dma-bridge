@@ -10,7 +10,8 @@
 #
 # Options: -d DIR  project directory on every node (default: this checkout's path)
 #          -u USER ssh user
-# Requires passwordless sudo on every node (scripts/cluster-bootstrap.sh).
+# Requires passwordless sudo on every node (scripts/cluster-bootstrap.sh); the
+# MokNew/MokList EFI variables are root-only, so even status needs it.
 #
 # The enrolment flow is: enroll (choose a one-time password) -> reboot the node ->
 # blue MokManager screen: Enroll MOK -> Continue -> Yes -> that password -> Reboot
@@ -70,8 +71,8 @@ cmd_enroll() {
 	echo "MokManager screen on its next boot. Use the same password on every node to keep it simple."
 	for n in "${NODES[@]}"; do
 		echo; echo "== enroll on $n =="
-		if run_on "$n" "mokutil --list-enrolled 2>/dev/null | grep -q '$CN'"; then echo "  already enrolled"; continue; fi
-		if run_on "$n" "mokutil --list-new 2>/dev/null | grep -q '$CN'"; then echo "  import already pending; reboot and complete MokManager"; continue; fi
+		if run_on "$n" "sudo -n mokutil --list-enrolled 2>/dev/null | grep -q '$CN'"; then echo "  already enrolled"; continue; fi
+		if run_on "$n" "sudo -n mokutil --list-new 2>/dev/null | grep -q '$CN'"; then echo "  import already pending; reboot and complete MokManager"; continue; fi
 		run_tty "$n" "sudo mokutil --import $MOK_DIR/MOK.der" || echo "  FAILED on $n"
 	done
 	echo; echo "Now reboot each node and complete: Enroll MOK -> Continue -> Yes -> password -> Reboot."
@@ -82,7 +83,7 @@ cmd_load() {
 	local n rc=0
 	for n in "${NODES[@]}"; do
 		echo "== load on $n =="
-		run_on "$n" "if ! mokutil --list-enrolled 2>/dev/null | grep -q '$CN'; then echo '  MOK not enrolled yet (reboot + MokManager first)'; exit 1; fi; sudo -n modprobe gb10_dmab && lsmod | grep -q '^gb10_dmab' && echo '  loaded' || { echo '  modprobe failed:'; sudo -n dmesg | grep -iE 'gb10_dmab|module verification' | tail -3 | sed 's/^/    /'; exit 1; }; sudo -n dmesg | grep gb10_dmab | tail -4 | sed 's/^/  /'; ls -l /dev/gb10_dmab | sed 's/^/  /'; cat /sys/class/misc/gb10_dmab/isolation | sed 's/^/  /'" || rc=1
+		run_on "$n" "if ! sudo -n mokutil --list-enrolled 2>/dev/null | grep -q '$CN'; then echo '  MOK not enrolled yet (reboot + MokManager first)'; exit 1; fi; sudo -n modprobe gb10_dmab && lsmod | grep -q '^gb10_dmab' && echo '  loaded' || { echo '  modprobe failed:'; sudo -n dmesg | grep -iE 'gb10_dmab|module verification' | tail -3 | sed 's/^/    /'; exit 1; }; sudo -n dmesg | grep gb10_dmab | tail -4 | sed 's/^/  /'; ls -l /dev/gb10_dmab | sed 's/^/  /'; cat /sys/class/misc/gb10_dmab/isolation | sed 's/^/  /'" || rc=1
 	done
 	return $rc
 }
@@ -91,7 +92,7 @@ cmd_status() {
 	local n
 	for n in "${NODES[@]}"; do
 		echo "== $n =="
-		run_on "$n" "echo \"  secure boot: \$(mokutil --sb-state 2>/dev/null | head -1)\"; echo \"  MOK enrolled: \$(mokutil --list-enrolled 2>/dev/null | grep -c '$CN')  pending import: \$(mokutil --list-new 2>/dev/null | grep -c '$CN')\"; k=/lib/modules/\$(uname -r)/extra/gb10_dmab.ko; if [ -f \$k ]; then echo \"  installed module: \$(modinfo -F vermagic \$k | cut -d' ' -f1), signer: \$(modinfo -F signer \$k)\"; else echo '  installed module: none'; fi; echo \"  loaded: \$(lsmod | grep -q '^gb10_dmab' && echo yes || echo no)\""
+		run_on "$n" "echo \"  secure boot: \$(mokutil --sb-state 2>/dev/null | head -1)\"; echo \"  MOK enrolled: \$(sudo -n mokutil --list-enrolled 2>/dev/null | grep -c '$CN')  pending import: \$(sudo -n mokutil --list-new 2>/dev/null | grep -c '$CN')\"; k=/lib/modules/\$(uname -r)/extra/gb10_dmab.ko; if [ -f \$k ]; then echo \"  installed module: \$(modinfo -F vermagic \$k | cut -d' ' -f1), signer: \$(modinfo -F signer \$k)\"; else echo '  installed module: none'; fi; echo \"  loaded: \$(lsmod | grep -q '^gb10_dmab' && echo yes || echo no)\""
 	done
 }
 
