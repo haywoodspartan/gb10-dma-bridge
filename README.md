@@ -138,7 +138,8 @@ sudo scripts/install.sh                  # make, sign, install to /lib/modules/.
 ```
 
 Manual equivalents: `make`, `make sign`, `make install`, `make load`,
-`make tools`. DKMS users: `dkms add .` with the provided `dkms.conf` (DKMS
+`make tools`. For a whole ring use `scripts/ring-mok.sh keys|build|enroll|load`
+(section 11). DKMS users: `dkms add .` with the provided `dkms.conf` (DKMS
 reuses the same MOK path on Ubuntu).
 
 Files installed: `/etc/modprobe.d/gb10_dmab.conf` (options),
@@ -287,6 +288,7 @@ scripts/ring-mtu.sh     MTU on every ring port of every node (passwordless sudo 
 scripts/node-admin.sh   per-node root worker: MTU live + netplan drop-in, isolcpus staging, status
 scripts/ring-admin.sh   runs node-admin.sh on every node (interactive sudo or passwordless)
 scripts/cluster-bootstrap.sh  passwordless sudo + full SSH mesh + project sync across the nodes
+scripts/ring-mok.sh     one MOK for the ring: create/copy, build+sign+install per node, enroll, load
 scripts/isolate-cores.sh   isolcpus/nohz_full/rcu_nocbs/irqaffinity via GRUB drop-in
 scripts/install.sh      MOK key setup, build, sign, install, load
 etc/                    modprobe, modules-load, udev
@@ -428,6 +430,7 @@ change little; they mainly cut per-packet overhead on the NIC.
 | `scripts/node-admin.sh` | the per-node root worker behind `ring-admin.sh`; also usable directly with `sudo`. |
 | `scripts/ring-mtu.sh` | non-interactive MTU variant for nodes that already have passwordless sudo. |
 | `scripts/ring-test.sh` | the GPU-fed RDMA test on every cable (above). |
+| `scripts/ring-mok.sh keys\|build\|enroll\|load\|status NODE...` | Secure Boot across the ring: one Machine Owner Key created on the first node and copied to the others, `make clean modules tools` + `sign` + `install` on every node against its own kernel, the interactive `mokutil --import` (one-time password per node, then reboot and confirm in MokManager), and `modprobe` afterwards. |
 
 State on 2026-11-09 after running them: every node reaches every other with
 key-based ssh and passwordless sudo; MTU 9000 everywhere; `isolcpus=domain,
