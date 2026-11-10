@@ -432,11 +432,32 @@ change little; they mainly cut per-packet overhead on the NIC.
 | `scripts/ring-test.sh` | the GPU-fed RDMA test on every cable (above). |
 | `scripts/ring-mok.sh keys\|build\|enroll\|load\|status NODE...` | Secure Boot across the ring: one Machine Owner Key created on the first node and copied to the others, `make clean modules tools` + `sign` + `install` on every node against its own kernel, the interactive `mokutil --import` (one-time password per node, then reboot and confirm in MokManager), and `modprobe` afterwards. |
 
-State on 2026-11-09 after running them: every node reaches every other with
+State on 2026-11-10 after running them: every node reaches every other with
 key-based ssh and passwordless sudo; MTU 9000 everywhere; `isolcpus=domain,
-managed_irq,16-19 nohz_full=16-19 rcu_nocbs=16-19 irqaffinity=0-15` staged in
-`/etc/default/grub.d/90-gb10-dmab.cfg` on all three nodes, **pending a reboot**
-of each node; `/etc/modprobe.d/gb10_dmab.conf` carries `cores=16-19`.
+managed_irq,16-19 nohz_full=16-19 rcu_nocbs=16-19 irqaffinity=0-15` active on
+all three nodes; one MOK enrolled on all three; `gb10_dmab` signed per kernel,
+installed and autoloaded on all three, each reporting four SCHED_FIFO engines
+on the isolated cpus 16-19 and the GB10 as default dma-buf peer.
+
+### First measurements of the engines (DGX-1 and DGX-2, `dmabctl` as root)
+
+| Test | Result |
+|---|---|
+| pin 2 x 512 MiB | 44 to 52 ms (20 to 25 GB/s pin rate) |
+| host -> host, one engine | 4.5 to 5.1 GB/s, verified |
+| host -> host, striped over 4 engines | 5.0 to 5.6 GB/s, verified |
+| host -> GPU-visible memory and back, GPU-verified | 5.1 to 5.6 GB/s each way, verified |
+| caller core `memcpy` / GPU `cuMemcpy` on host memory | 3.8 to 4.9 GB/s |
+
+Functionally everything checks out. The bandwidth is far below what the
+GPU gets from the same pages (over 100 GB/s with `ringbw`), and striping over
+four engines in one cluster barely beats one engine: the per-engine rate
+collapses when all four run. The working hypothesis is a per-cluster ceiling
+of roughly 10 to 12 GB/s of memory traffic on the CPU die's path to the
+LPDDR5X (cpus 10-19 share one DSU), which a single core already saturates.
+Next step: measure per-cluster CPU memory bandwidth and, if confirmed, spread
+the engines across both clusters (for example `cores=8,9,18,19`, with the
+isolation set changed to match).
 
 Each sender iteration prints wire GB/s; each receiver iteration prints the
 GPU verify time, which is also the GPU's read bandwidth from NIC-written
