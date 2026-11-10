@@ -115,14 +115,16 @@ Where it is useful on a Spark:
 
 ## 3. Which four cores
 
-Default `cores=16-19`: four Cortex-X925 cores of the second cluster (the
-X925s are cpus 5-9 and 15-19; the A725s are 0-4 and 10-14). cpu 15 stays a
-big core for housekeeping in that cluster, and cluster 0-9 is untouched. The
-X925s give the highest per-core copy bandwidth; if you would rather keep the
-big cores for compute, four A725s (`cores=11-14`) still outrun any PCIe
-endpoint on the Spark. `scripts/isolate-cores.sh --status` prints the core
-type of each chosen CPU so the choice is visible. Override with `cores=`; the
-module refuses offline CPUs and refuses to take every CPU.
+Measured answer (section 12): **spread the engines over both CPU clusters.**
+On GB10 each cluster (cpus 0-9 and cpus 10-19) has its own ceiling on memory
+traffic, about 7 to 8 GB/s for cluster 0-9 and 10 to 11 GB/s for cluster 10-19,
+and a single core already saturates it. Four engines in one cluster copy at
+5.3 GB/s; two per cluster copy at 7 to 9 GB/s. Big (X925) and little (A725)
+pairs perform the same, so pick by what you would rather keep for compute:
+`cores=8,9,18,19` (X925) or `cores=2,3,12,13` (A725). The isolation set in
+`scripts/isolate-cores.sh --apply -c ...` must match. The shipped default is
+still `16-19` because that is what the running nodes were set up with;
+`scripts/isolate-cores.sh --status` prints the core type of each chosen CPU.
 
 ---
 
@@ -283,6 +285,7 @@ include/uapi/gb10_dmab.h   user ABI
 tools/dmabctl.c         info / bench / udmabuf / cuda / bar
 tools/rdma_dmabuf_check.c  GPU<->NIC registration paths (dma-buf, direct, ATS system memory)
 tools/ringbw.c          RDMA ring bandwidth test, GPU fill on the sender, GPU verify on the receiver
+tools/membw.c           pinned-thread read/write/copy bandwidth per core, cluster or core set
 scripts/ring-test.sh    discovers the cables over SSH and runs ringbw on every cable of the ring
 scripts/ring-mtu.sh     MTU on every ring port of every node (passwordless sudo variant)
 scripts/node-admin.sh   per-node root worker: MTU live + netplan drop-in, isolcpus staging, status
@@ -469,3 +472,53 @@ Gen5 x4 endpoint, not the 200 Gb/s port, is the limit.
 For collectives, NCCL is not installed here; when you add it, expect it to
 use host (system) buffers (`NCCL_NET_GDR_LEVEL` will not apply, there is no
 GDR on GB10) and both ring links (`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`).
+
+---
+
+## 12. CPU memory bandwidth on GB10 and engine placement
+
+The engines turned out to be bandwidth-bound by the CPU complex, not by the
+driver. `tools/membw` pins one thread per CPU and measures streaming read,
+write and `memcpy` on private THP-backed buffers (DGX-1, 2026-11-10, best of
+5, GB/s; copy counts bytes copied):
+
+| Threads on CPUs | Read | Write | Copy |
+|---|---|---|---|
+| 16 (one X925, cluster 10-19) | 8.2 | 6.0 | 4.95 |
+| 5 (one X925, cluster 0-9) | 7.2 | 4.5 | 3.7 |
+| 0 (one A725) | 4.7 | 2.6 | 4.4 |
+| 16-19 (four X925, one cluster) | 10.3 | 8.5 | 5.6 |
+| 5-8 (four X925, other cluster) | 7.7 | 4.0 | 3.8 |
+| 6,7,16,17 (two per cluster, X925) | 16.7 | 11.8 | 7.7 to 8.5 |
+| 2,3,12,13 (two per cluster, A725) | 16.7 | 10.6 | 10.3 to 10.6 |
+| 5-9,15-19 (all ten X925) | 19.8 | 14.3 | 10.6 |
+| 0-19 (all twenty cores) | 25.6 | 20.2 | 13.4 |
+| 16 with 4 KiB pages instead of THP | 8.0 | 4.9 | 4.3 |
+
+Three facts follow. Each cluster's path to the LPDDR5X carries roughly 10 GB/s
+of traffic (cluster 0-9 somewhat less), and one core can saturate it. The
+whole CPU complex tops out near 27 GB/s of reads or 13 GB/s of copy, while
+GPU kernels read and write the same pages at 100 to 160 GB/s (`ringbw`) and
+each ConnectX-7 cable DMAs at 13.6 GB/s. Page size does not matter.
+
+The engines track the same curve (`dmabctl bench -s 1024 -n 6 -S` after
+`modprobe gb10_dmab cores=...`, kernel-measured, per-engine rate from
+`/sys/class/misc/gb10_dmab/engines`):
+
+| `cores=` | Striped copy | Per engine while busy |
+|---|---|---|
+| 16-19 | 5.3 GB/s | 1.3 to 1.6 |
+| 7,8,17,18 | 7.2 GB/s | 1.8 (cluster 0-9), 3.1 (cluster 10-19) |
+| 2,3,12,13 | 7.3 to 8.7 GB/s | 1.9 to 2.2 and 2.4 to 2.6 |
+| 1,2,11,12 | 6.9 GB/s | 1.7 and 2.5 |
+| 1-4,11-14 (eight A725) | 7.0 GB/s | |
+
+What this means for a CPU-core DMA bridge on GB10: four cores can move about
+7 to 9 GB/s if split across the clusters, and no number of cores moves more
+than about 13 GB/s. That is enough to feed or drain one 200 GbE cable, and it
+is the right tool for BAR/MMIO staging and for keeping copies off application
+cores, but bulk host-memory movement is an order of magnitude faster on the
+GPU's SMs, and NIC traffic should land directly in GPU-visible memory as
+section 11 describes. One more observation from `dmabctl cuda`: the GPU's
+copy engines (`cuMemcpy` between host buffers) run at only 4 to 5 GB/s through
+ATS, so "use the GPU" means a copy kernel, not `cudaMemcpy`.

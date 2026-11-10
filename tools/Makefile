@@ -8,7 +8,7 @@ CFLAGS += -DHAVE_CUDA -I$(CUDA_HOME)/include
 LDLIBS += -lcuda
 endif
 
-TARGETS = dmabctl
+TARGETS = dmabctl membw
 ifneq ($(and $(wildcard $(CUDA_HOME)/include/cuda.h),$(wildcard /usr/include/infiniband/verbs.h)),)
 TARGETS += rdma_dmabuf_check
 ifneq ($(wildcard /usr/include/rdma/rdma_cma.h),)
@@ -24,6 +24,9 @@ all: $(TARGETS)
 dmabctl: dmabctl.c ../include/uapi/gb10_dmab.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
+membw: membw.c
+	$(CC) $(CFLAGS) -O2 -pthread -o $@ $<
+
 rdma_dmabuf_check: rdma_dmabuf_check.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS) -libverbs
 
@@ -31,6 +34,6 @@ ringbw: ringbw.c
 	$(CC) $(CFLAGS) -pthread -o $@ $< $(LDLIBS) $(NVRTC_FLAGS) -lrdmacm -libverbs
 
 clean:
-	rm -f dmabctl rdma_dmabuf_check ringbw
+	rm -f dmabctl rdma_dmabuf_check ringbw membw
 
 .PHONY: all clean
