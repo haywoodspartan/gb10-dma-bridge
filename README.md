@@ -20,7 +20,7 @@ Measured on this DGX Spark (`lspci`, `nvidia-smi -q`, sysfs):
 | Device | Address | Link | Notes |
 |---|---|---|---|
 | GB10 GPU (10de:2e12) | `000f:01:00.0` | PCIe **2.5 GT/s x1** | BAR0 64 MiB only, no BAR1. `Addressing Mode: ATS`, `FB Memory: N/A` |
-| ConnectX-7, 2 ports / 4 PFs | `0000:01:00.{0,1}`, `0002:01:00.{0,1}` | PCIe Gen5 x4 (~16 GB/s each) | `mlx5_core`, RoCE devices present |
+| ConnectX-7, 2 ports / 4 PFs | `0000:01:00.{0,1}`, `0002:01:00.{0,1}` | 2 x PCIe Gen5 x4 (13.6 GB/s each alone, 24.5 GB/s per port with both halves busy, measured) | One NIC in Socket Direct mode: its x8 is split into two x4 links to the SoC, and *each* link exposes *both* ports (`f0` = port 0, `f1` = port 1). Ports run 200GbE over 2 lanes; `mlx5_core`, 4 RoCE devices |
 | NVMe PM9C1a | `0004:01:00.0` | PCIe Gen4 x4 | |
 | SMMUv3 | 3 instances | | `iommu.passthrough=0`, translated DMA domains |
 | CPU | 20 cores | | Cortex-A725: cpus 0-4, 10-14. Cortex-X925: cpus 5-9, 15-19. Two L3 clusters (0-9, 10-19) |
@@ -125,6 +125,11 @@ pairs perform the same, so pick by what you would rather keep for compute:
 `scripts/isolate-cores.sh --apply -c ...` must match. The shipped default is
 still `16-19` because that is what the running nodes were set up with;
 `scripts/isolate-cores.sh --status` prints the core type of each chosen CPU.
+
+Note (2026-11-12): that advice comes from a boot in which the memory system
+was in a slow operating point (section 13). On the current boot the four
+engines on `16-19` alone copy 49 GB/s striped, so spreading across clusters
+only matters in the slow state.
 
 ---
 
@@ -286,6 +291,8 @@ tools/dmabctl.c         info / bench / udmabuf / cuda / bar
 tools/rdma_dmabuf_check.c  GPU<->NIC registration paths (dma-buf, direct, ATS system memory)
 tools/ringbw.c          RDMA ring bandwidth test, GPU fill on the sender, GPU verify on the receiver
 tools/membw.c           pinned-thread read/write/copy bandwidth per core, cluster or core set
+tools/gpuhostbw.cu      GPU SM read/write/copy bandwidth on host memory (mmap/THP/4K, cudaHostAlloc, managed, cudaMalloc)
+tools/memlat.c          dependent-load memory latency from one CPU (fingerprint of the memory operating point)
 scripts/ring-test.sh    discovers the cables over SSH and runs ringbw on every cable of the ring
 scripts/ring-mtu.sh     MTU on every ring port of every node (passwordless sudo variant)
 scripts/node-admin.sh   per-node root worker: MTU live + netplan drop-in, isolcpus staging, status
@@ -313,12 +320,20 @@ scripts/isolate-cores.sh --status            # RESULT: OK once isolcpus is activ
 ## 11. Three-node ring over ConnectX-7
 
 Topology as configured by NVIDIA Sync on 2026-11-09 and read back from all
-three nodes over SSH. Each Spark's two 400G QSFP ports are split into two
-200 GbE halves (`f0np0` and `f1np1` of each PCIe endpoint), and each half goes
-to a different neighbour, so every pair of nodes is joined by **two** 200 GbE
-cables and every node has four ring links:
+three nodes over SSH, corrected on 2026-11-12 after checking the hardware
+(section 13). Each Spark has two QSFP ports, each running 200GbE over two
+lanes (`mstlink`: `200G 2x`, RS-FEC; the DACs are 400G-capable QSFP112 parts
+but the port only enables up to 200G). The ConnectX-7 is wired **Socket
+Direct**: its PCIe x8 is split into two Gen5 x4 links to the SoC (domains
+`0000` and `0002`), and each link exposes *both* ports as a PF. So every
+physical port appears twice: `enp1s0f0np0` and `enP2p1s0f0np0` are the same
+port 0 reached over different PCIe links (same cable serial in `ethtool -m`,
+identical `rx/tx_bytes_phy` counters), and `enp1s0f1np1` / `enP2p1s0f1np1`
+are port 1. Every pair of nodes is therefore joined by **one** cable that
+carries two /24 subnets, one per PCIe link, and every node has four ring
+netdevs on two cables:
 
-| Cable (/24) | Node A side | Node B side |
+| Link (/24) | Node A side | Node B side |
 |---|---|---|
 | 10.100.32 | DGX-1 `enp1s0f0np0` .2 | DGX-2 `enp1s0f1np1` .1 |
 | 10.100.33 | DGX-1 `enP2p1s0f0np0` .2 | DGX-2 `enP2p1s0f1np1` .1 |
@@ -327,10 +342,12 @@ cables and every node has four ring links:
 | 10.100.36 | DGX-3 `enp1s0f0np0` .2 | DGX-1 `enp1s0f1np1` .1 |
 | 10.100.37 | DGX-3 `enP2p1s0f0np0` .2 | DGX-1 `enP2p1s0f1np1` .1 |
 
-All six links are 200 Gb/s RoCE v2, ACTIVE, sub-millisecond ping. Each node's
-`enp1s0*` links share PCIe endpoint `0000:01:00.x` and its `enP2p1s0*` links
-share `0002:01:00.x`, both Gen5 x4, so each endpoint carries one link in and
-one link out of the ring direction. `rdma-core 50`, `perftest 24.01` (no CUDA),
+Rows 10.100.32/.33, .34/.35 and .36/.37 are the three physical cables. All
+four netdevs per node report 200 Gb/s RoCE v2, ACTIVE, sub-millisecond ping,
+but the two netdevs on one port share its 200 Gb/s. Each node's `enp1s0*`
+netdevs share PCIe link `0000:01:00.x` and its `enP2p1s0*` netdevs share
+`0002:01:00.x`, both Gen5 x4, so each PCIe link carries one half of the
+traffic in and one half out of the ring direction. `rdma-core 50`, `perftest 24.01` (no CUDA),
 no NCCL, `nvidia-peermem` unusable on this kernel. All twelve ring netdevs
 run MTU 9000 (RoCE `active_mtu` 4096), set live and persisted on every node
 by `scripts/ring-admin.sh --mtu 9000` in `/etc/netplan/99-zz-spark-ring-mtu.yaml`,
@@ -414,10 +431,22 @@ all six cables carrying traffic simultaneously, ring order DGX-1 -> DGX-3 -> DGX
 | DGX-3 -> DGX-2, both cables | 13.56 / 13.62 GB/s | 3.11 / 3.12 ms |
 | DGX-2 -> DGX-1, both cables | 13.48 / 13.43 GB/s | 3.63 / 3.47 ms |
 
-Every iteration verified on the receiving GPU. That is about 81 GB/s of
-GPU-produced, GPU-consumed data moving around the ring at once, 27 GB/s out
-and 27 GB/s in per node, with each PCIe Gen5 x4 endpoint at its practical
-limit in both directions.
+Every iteration verified on the receiving GPU. Summed, that is about 81 GB/s
+of GPU-produced, GPU-consumed data, 27 GB/s out and 27 GB/s in per node, with
+each PCIe Gen5 x4 link at its practical limit in both directions.
+
+**Correction (2026-11-12):** the two rows of each pair are the two PCIe halves
+of *one* 200 Gb/s cable, and `ring-test.sh` starts cable 0 and cable 1 as
+separate waves two seconds apart while each run lasts well under a second, so
+the two halves of a port were not on the wire at the same time. 13.6 GB/s is
+what one PCIe x4 half does alone; two halves driving the same port together
+are capped by the 200G line rate (about 24 GB/s of RoCE payload), not 27.2.
+Measured the same day with `ib_write_bw` (section 13): each half alone
+111.8 Gb/s (14.0 GB/s), both halves of the port at once 98.0 Gb/s each,
+196 Gb/s (24.5 GB/s) in total. A cable carries 24.5 GB/s per direction, a
+node sends 49 GB/s into the ring and receives 49 GB/s from it, and the
+81 GB/s above is a sum of halves that never overlapped; run together, the
+three cables would carry about 73 GB/s.
 
 Repeated after MTU 9000 (RoCE 4096) with `-s 1024 -n 10`: 13.37 to 13.44 GB/s
 average per cable, best 13.69 GB/s, receiver GPU verify 6.0 to 7.8 ms per
@@ -477,6 +506,14 @@ GDR on GB10) and both ring links (`NCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0`).
 
 ## 12. CPU memory bandwidth on GB10 and engine placement
 
+**Read section 13 first:** every number in this section was taken on the
+boot of 2026-11-10. On the next boot (2026-11-11, same kernel, cmdline,
+governor and binaries) the same `membw` read 7 to 8 times faster (78 GB/s
+on cpus 16-19, 153 GB/s on all twenty cores) and the striped engine copy
+went from 5.3 to 49 GB/s. The per-cluster "ceiling" below is an operating
+point of the memory system, not a fabric limit, and nothing in Linux shows
+which one a boot is in; `tools/memlat` and one `membw` line tell you.
+
 The engines turned out to be bandwidth-bound by the CPU complex, not by the
 driver. `tools/membw` pins one thread per CPU and measures streaming read,
 write and `memcpy` on private THP-backed buffers (DGX-1, 2026-11-10, best of
@@ -499,7 +536,8 @@ Three facts follow. Each cluster's path to the LPDDR5X carries roughly 10 GB/s
 of traffic (cluster 0-9 somewhat less), and one core can saturate it. The
 whole CPU complex tops out near 27 GB/s of reads or 13 GB/s of copy, while
 GPU kernels read and write the same pages at 100 to 160 GB/s (`ringbw`) and
-each ConnectX-7 cable DMAs at 13.6 GB/s. Page size does not matter.
+each ConnectX-7 cable DMAs at 24.5 GB/s (13.6 GB/s per PCIe half). Page
+size does not matter.
 
 The engines track the same curve (`dmabctl bench -s 1024 -n 6 -S` after
 `modprobe gb10_dmab cores=...`, kernel-measured, per-engine rate from
@@ -522,3 +560,188 @@ GPU's SMs, and NIC traffic should land directly in GPU-visible memory as
 section 11 describes. One more observation from `dmabctl cuda`: the GPU's
 copy engines (`cuMemcpy` between host buffers) run at only 4 to 5 GB/s through
 ATS, so "use the GPU" means a copy kernel, not `cudaMemcpy`.
+
+---
+
+## 13. The SoC block diagram against what Linux exposes (2026-11-12)
+
+GB10 is two dies joined by NVLink-C2C. The CPU die (a MediaTek MT8901-class
+design, which is why `mt8901-pinctrl`, `DRAM8901` and `MTKW*` ACPI IDs show
+up) carries the HSIO block (PCIe root ports, USB), two CPU clusters, the
+fabric, and two LPDDR5X memory subsystems with their PHYs. The GPU die
+carries the SMs, the video engines and the other end of C2C. Reading the
+ACPI tables of this node (`DSDT`, `IORT`, `PPTT`, decompiled with `iasl`)
+together with sysfs gives this map:
+
+| Block in the diagram | What Linux sees | Driver |
+|---|---|---|
+| HSIO | Root ports `10de:22ce` (Gen5 x4: CX7 link A, CX7 link B, NVMe), `10de:22d0` (Gen4 x1: 10GbE, Wi-Fi), `10de:22d1` (x16-capable, carries the GPU's 2.5 GT/s x1 management link); xHCI `NVDA8000/8001` x6; USB4 hosts `NVDA8100` x4 | `pcieport`, `xhci-hcd`; nothing binds USB4 |
+| CPU clusters | `CLU0`/`CLU1` in PPTT = cpus 0-9 and 10-19, each 5 x A725 (512 KiB L2) + 5 x X925 (2 MiB L2), 8 MiB L3 per cluster; PMUs `armv8_pmuv3_0/1`, `arm_spe_0` (SPE works); CPPC through `cppc_cpufreq`, governor `performance`, 2.8 GHz (A725) / 3.9 GHz (X925) | yes |
+| Fabric | no ACPI device, no uncore PMU (no `arm_cspmu`, CMN or DSU PMU node) | none |
+| Memory subsystems | `DRAM8901` (`\_SB_.DRAM`: four 8 KiB register windows at 0x10200000/0x10206000/0x10208000/0x1C004000); `SSPM` (`MTKW8400`, MediaTek system power manager, 320 KiB at 0x1C8B0000, hidden when the OS claims to be Windows); `MTEL` (`NVDA8800`, read-only telemetry SRAM of the CPU DVFS microcontroller "CPUEB" at 0x05170000, with the CPPC registers, a perf-counter log and a "fastdvfs" log inside it, offsets published by its `_DSM`) | none, none, CPPC only. No `devfreq`, no NUMA/HMAT: one node, no bandwidth control |
+| C2C | `nvidia-smi c2c -s`: 8 links x 43.125 GB/s = 345 GB/s per direction; GPU `Addressing Mode: ATS` with ATS and PASID enabled in its PCIe config, alone on SMMU 0x13000000 in a strict `DMA` domain; `/proc/driver/nvidia` says `DMA Size: 41 bits` | `nvidia` |
+| GPU cores, video | 48 SMs, `sm_121`, graphics 2.4 GHz (max 3.0), video 2.1 GHz; HDA controller `NVDA2014` sits on the GPU's SMMU | `nvidia`, `snd_hda_acpi` |
+| Peripheral DMA | `DMA0` (`NVDA2861`): 4 KiB of registers at 0x14200000, `_CCA = 0` (non-coherent), no interrupt, behind the third SMMU (0x14900000) with the three SPI controllers `NVDA0210` | **none** (no in-tree driver matches `NVDA2861`; SPI has none either) |
+| NIC (second diagram) | Socket Direct: GB10 PCIe ports 6:9 and 10:13 feed `PEX1[3:0]` and `PEX1[7:4]` of the CX7; both halves see both QSFP ports (section 11). Firmware 28.50.1002, PSID `NVD0000000087`, `ATS_ENABLED = False`, no `sd_group` reported, so `mlx5_core`'s multi-PF netdev (Socket Direct merging, present in this kernel) stays off | `mlx5_core`, four PFs in `DMA-FQ` SMMU domains |
+
+What this means for "experimental stuff":
+
+* `DMA0` is the only hardware DMA engine the firmware admits to. Four KiB of
+  registers, non-coherent, no IRQ, next to the SPI controllers: most likely
+  MediaTek's CQDMA/HSDMA memory-copy block or the SPI DMA. Identifying it
+  means reading its registers from a signed kernel module (lockdown blocks
+  `/dev/mem`), and only after confirming its clock is on, because touching a
+  gated MediaTek peripheral stalls the bus. Even if it works it will not beat
+  the GPU numbers below. Low priority, noted for completeness.
+* The fabric and memory DVFS are run by the SSPM/CPUEB firmware and Linux
+  has no interface to them. The measurements below show that this is the
+  single biggest factor in CPU-side copy bandwidth.
+* The SMMU performance monitors (`smmuv3_pmcg_*`) work with `perf` and the
+  GPU's ATS traffic lands on `smmuv3_pmcg_13002` alone.
+* Socket Direct merging in `mlx5_core` needs firmware support this board
+  does not advertise; `mstconfig` has no parameter for it.
+
+### GPU SMs as the DMA engine (`tools/gpuhostbw`)
+
+`gpuhostbw` hands a plain host pointer to GPU kernels (pageable memory
+access through ATS, `usesHostPageTables = 1`) and measures streaming read,
+write and copy with 192 blocks x 512 threads. 1 GiB buffers, best of 10,
+this node, GB/s:
+
+| Backing | Read | Write | Copy (bytes copied) |
+|---|---|---|---|
+| `mmap` + `MADV_HUGEPAGE` (THP, verified) | 162 | 113 | 77 |
+| `mmap` + `MADV_NOHUGEPAGE` (4 KiB pages) | 169 | 109 | 77 |
+| `cudaHostAlloc` (pinned) | 191 | 190 | 106 |
+| `cudaMalloc` (reference, same LPDDR5X over C2C) | 249 | 197 | 109 |
+
+So the GPU copies host memory at 77 to 106 GB/s, six to eight times what the
+whole CPU complex manages in section 12 and ten times four `gb10_dmab`
+engines. For host-to-host bulk moves the right "DMA engine" on GB10 is a
+copy kernel on the SMs, and the right buffer for it is `cudaHostAlloc`
+memory (which the NIC can also register, since it has CPU page tables).
+Pageable memory loses about 15 % on reads and 40 % on writes against pinned;
+the counters below show why it is not the translation.
+
+### What the GPU's ATS path costs (SMMU PMCG counters)
+
+`sudo perf stat -a -e smmuv3_pmcg_13002/{transaction,tlb_miss,trans_table_walk_access,pcie_ats_trans_rq}/`
+around `gpuhostbw -m read -s 1024 -n 20` (21 launches = 22.5 GB read):
+
+| Backing | ATS translation requests | SMMU TLB misses | Page-table walks | Read GB/s |
+|---|---|---|---|---|
+| THP | 1.72 M (13 KB per request) | 0.31 M | 0.32 M | 168 |
+| 4 KiB pages | 9.87 M (2.3 KB per request) | 6.18 M | 6.38 M | 165 |
+| `cudaHostAlloc` | 9.41 M | 6.24 M | 6.86 M | 194 |
+
+Every GPU access to system memory is an ATS request; with 4 KiB pages the
+SMMU walks page tables 6.4 million times for 22 GB and still sustains 165
+GB/s, so page size does not matter for GPU reads of host memory, just as it
+did not for the CPU. Pinned memory is translated at 4 KiB granularity too
+and is nevertheless the fastest, so its advantage comes from how the driver
+maps it (memory attributes, no coherence traffic with the CPU caches), not
+from fewer translations.
+
+### CPU memory bandwidth depends on a DVFS state the CPU does not control
+
+The same `tools/membw` as section 12, same node, same binary, run right
+after `gpuhostbw` had been streaming memory (GB/s, read / write / copy):
+
+| CPUs | Section 12 (2026-11-10) | 2026-11-12, GPU just active | with GPU copying 83 GB/s | with GPU copying 189 GB/s |
+|---|---|---|---|---|
+| 16-19 (four X925, one cluster) | 10.3 / 8.5 / 5.6 | 77.7 / 68.4 / 49.2 | 64.3 / 67.1 / 41.5 | 24.9 / 66.5 / 13.8 |
+| 2,3,12,13 (two A725 per cluster) | 16.7 / 10.6 / 10.3 | 124.9 / 89.4 / 70.3 | 96.3 / 89.5 / 55.1 | 40.4 / 88.4 / 24.3 |
+| 0-19 (all twenty) | 25.6 / 20.2 / 13.4 | 153.1 / 130.8 / 89.5 | 126.9 / 140.3 / 75.0 | 56.7 / 123.3 / 33.6 |
+
+Seven to eight times the section 12 numbers, from nothing but the state of
+the memory system. One cluster of four X925 reads 78 GB/s, the whole CPU
+complex 153 GB/s read and 131 GB/s write, and the GPU's traffic shares the
+same 273 GB/s LPDDR5X with it (under the 189 GB/s GPU load, CPU reads fall
+to the remainder while CPU writes are hardly touched). The engines follow:
+`dmabctl bench -s 1024 -n 6 -S` with the stock `cores=16-19` copies at
+**48.9 GB/s average, 49.5 best, verified**, against 5.3 GB/s on 2026-11-10,
+the caller-core `memcpy` baseline went from 4 to 23.7 GB/s and the pin rate
+from 22 to 68 GB/s.
+
+What the state is and what sets it is not yet known. The slow numbers were
+taken on the boot of 2026-11-10 01:12, the fast ones on the boot of
+2026-11-11 03:42; kernel, cmdline, governor (`performance`, set by
+`nv-cpu-governor.service`), THP and binaries are the same. It is not a
+short-lived effect of GPU traffic: sampled every 30 s for six minutes after
+the GPU went idle (P0, 2.4 GHz, 0 to 5 % utilisation, 10 W), cpus 16-19
+stayed at 80 / 70 / 51 GB/s. The GPU reports no thermal or power slowdown.
+Linux exposes no devfreq, no HMAT and no memory-controller driver, and the
+CPUEB telemetry SRAM that would show the DSU/fabric/DRAM operating points is
+behind lockdown (experiment 4). Fingerprint of the fast state, for telling
+boots apart: `tools/memlat 16` 115 ns per dependent load (128 ns with 4 KiB pages),
+`tools/memlat 0` 166 ns, and one core alone reads 33 GB/s (X925, cpu 16) or
+39 GB/s (A725, cpu 0) in `membw`, against 8.2 and 4.7 GB/s in section 12. A
+boot that shows 8 GB/s from one core is in the slow state; expect its
+latency to be several hundred ns.
+
+### Experiments: done, and proposed
+
+Done on 2026-11-12 (above): GPU SM bandwidth on host memory by backing type,
+SMMU PMCG counting of the GPU's ATS traffic, CPU bandwidth versus memory
+DVFS state and versus GPU load, and the Socket Direct topology check
+(`ethtool -m` serials, `*_phy` counters, `mstlink`).
+
+Also done the same day: the shared-port ceiling, measured for real.
+`ib_write_bw -s 1048576 -q 4 -D 10 -x 3 --report_gbits` from DGX-1's
+`rocep1s0f0` (PCIe domain `0000`) and `roceP2p1s0f0` (domain `0002`) to
+DGX-2's `rocep1s0f1` and `roceP2p1s0f1`, the two halves of cable
+10.100.32/.33, servers started on DGX-2 over ssh:
+
+| Run | Half A (`0000`) | Half B (`0002`) | Total |
+|---|---|---|---|
+| A alone | 111.8 Gb/s (14.0 GB/s) | | 14.0 GB/s |
+| B alone | | 111.8 Gb/s (14.0 GB/s) | 14.0 GB/s |
+| A and B at once | 98.0 Gb/s (12.3 GB/s) | 98.0 Gb/s (12.3 GB/s) | 196.1 Gb/s (24.5 GB/s) |
+
+Alone, each half is PCIe-bound at the same 111.8 Gb/s to the fourth digit.
+Together they share the 200G port evenly and the sum is its line rate:
+`tx_bytes_phy` of `enp1s0f0np0` and `enP2p1s0f0np0` advanced by the same
+250 GB during the run, 25.0 GB/s on the wire with headers. So a cable is
+worth 24.5 GB/s per direction, a node can send 49 GB/s into the ring and
+take 49 GB/s out of it, and the per-half 13.6 GB/s figures in section 11
+become 12.3 GB/s whenever both halves of a port are busy. The engines'
+49 GB/s striped copy on this boot is exactly what one node can feed to both
+neighbours at once; the 5.3 GB/s of the slow state is a fifth of it.
+
+Proposed, in order of expected payoff:
+
+1. **Pin down the memory operating point.** Run `tools/memlat 16` and
+   `tools/membw -s 256 -n 3 16-19` right after boot and again after the GPU
+   has been used, across several boots, and log them next to the
+   `nvidia-smi` pstate. If the slow state comes back, test what lifts it: a
+   GPU copy loop (`gpuhostbw -L 30 -s 512 -P -b 8`), `nvidia-persistenced`
+   off and on, a display attached or not, and whether the engines' own
+   traffic ever lifts it. Until this is understood, measure before trusting
+   any engine number, and read sections 3 and 12 as "the slow state".
+2. **400G on the DACs.** The cables and the CX7 silicon are 400G parts and
+   the port advertises `200G_2X,200G_4X,...` only. `mstlink -d <bdf>
+   --speeds 400G_4X` on both ends of one cable (link drops while it
+   retrains) would show whether the Spark's firmware/board allow it. The
+   second diagram labels the ports 200G, so expect "no"; the PCIe side would
+   remain the limit at 27 GB/s per node anyway.
+3. **GPU reads of a PCIe BAR through ATS.** `mmap` a BAR (`resource0` of a
+   device whose registers are side-effect free to read, e.g. the NVMe
+   controller's CAP/VS at offset 0), `cudaHostRegister(...,
+   cudaHostRegisterIoMemory)`, read it from a kernel. If the SMMU forwards
+   the Device-memory translation, the GPU can stage FPGA/BAR data itself at
+   C2C speed and `gb10_dmab`'s BAR endpoint becomes a fallback. If not, the
+   process gets an Xid; run it with nothing else on the GPU.
+4. **CPUEB telemetry reader.** A small signed module that `ioremap`s the
+   `MTEL` region (read-only SRAM) and exposes the perf-counter and fastdvfs
+   logs in debugfs; the `_DSM` gives the offsets. This is the only visible
+   window into the DVFS microcontroller and might show the DSU/fabric and
+   DRAM operating points directly, which would turn experiment 1 from a
+   hypothesis into a knob.
+5. **Identify `DMA0`.** Same kind of module, reading the 4 KiB at
+   0x14200000 and matching it against `mtk-cqdma`/`mtk-hsdma` register
+   layouts. Only after the clock question is settled; see above.
+6. **ATS on the NIC.** `mstconfig -d 0000:01:00.0 set ATS_ENABLED=1` (both
+   halves, reboot) lets the CX7 cache SMMU translations and makes ODP
+   (`IBV_ACCESS_ON_DEMAND`, implicit MRs) viable for "register nothing"
+   RDMA into any process memory. Bandwidth will not change; registration
+   cost and the NIC's behaviour under page migration will.

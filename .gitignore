@@ -15,6 +15,9 @@ modules.order
 tools/dmabctl
 tools/rdma_dmabuf_check
 tools/ringbw
+tools/membw
+tools/gpuhostbw
+tools/memlat
 # editor / app state
 .claude/
 *.swp
