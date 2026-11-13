@@ -20,7 +20,7 @@ Measured on this DGX Spark (`lspci`, `nvidia-smi -q`, sysfs):
 | Device | Address | Link | Notes |
 |---|---|---|---|
 | GB10 GPU (10de:2e12) | `000f:01:00.0` | PCIe **2.5 GT/s x1** | BAR0 64 MiB only, no BAR1. `Addressing Mode: ATS`, `FB Memory: N/A` |
-| ConnectX-7, 2 ports / 4 PFs | `0000:01:00.{0,1}`, `0002:01:00.{0,1}` | 2 x PCIe Gen5 x4 (13.6 GB/s each alone, 24.5 GB/s per port with both halves busy, measured) | One NIC in Socket Direct mode: its x8 is split into two x4 links to the SoC, and *each* link exposes *both* ports (`f0` = port 0, `f1` = port 1). Ports run 200GbE over 2 lanes; `mlx5_core`, 4 RoCE devices |
+| ConnectX-7, 2 ports / 4 PFs | `0000:01:00.{0,1}`, `0002:01:00.{0,1}` | 2 x PCIe Gen5 x4, each shared by both ports: 15.1 GB/s in and 14.0 GB/s out per link, 24.5 GB/s per port, 30.1 GB/s in and 27.7 GB/s out per node (measured, section 14) | One NIC in Socket Direct mode: its x8 is split into two x4 links to the SoC, and *each* link exposes *both* ports (`f0` = port 0, `f1` = port 1). Ports run 200GbE over 2 lanes; `mlx5_core`, 4 RoCE devices |
 | NVMe PM9C1a | `0004:01:00.0` | PCIe Gen4 x4 | |
 | SMMUv3 | 3 instances | | `iommu.passthrough=0`, translated DMA domains |
 | CPU | 20 cores | | Cortex-A725: cpus 0-4, 10-14. Cortex-X925: cpus 5-9, 15-19. Two L3 clusters (0-9, 10-19) |
@@ -290,10 +290,12 @@ include/uapi/gb10_dmab.h   user ABI
 tools/dmabctl.c         info / bench / udmabuf / cuda / bar
 tools/rdma_dmabuf_check.c  GPU<->NIC registration paths (dma-buf, direct, ATS system memory)
 tools/ringbw.c          RDMA ring bandwidth test, GPU fill on the sender, GPU verify on the receiver
+tools/ringgather.c      the head gathers GPU-produced slices from the other nodes over every NIC path at once
 tools/membw.c           pinned-thread read/write/copy bandwidth per core, cluster or core set
 tools/gpuhostbw.cu      GPU SM read/write/copy bandwidth on host memory (mmap/THP/4K, cudaHostAlloc, managed, cudaMalloc)
 tools/memlat.c          dependent-load memory latency from one CPU (fingerprint of the memory operating point)
 scripts/ring-test.sh    discovers the cables over SSH and runs ringbw on every cable of the ring
+scripts/ring-gather.sh  run on the head: starts ringgather workers on the other nodes and gathers from all of them
 scripts/ring-mtu.sh     MTU on every ring port of every node (passwordless sudo variant)
 scripts/node-admin.sh   per-node root worker: MTU live + netplan drop-in, isolcpus staging, status
 scripts/ring-admin.sh   runs node-admin.sh on every node (interactive sudo or passwordless)
@@ -443,10 +445,12 @@ what one PCIe x4 half does alone; two halves driving the same port together
 are capped by the 200G line rate (about 24 GB/s of RoCE payload), not 27.2.
 Measured the same day with `ib_write_bw` (section 13): each half alone
 111.8 Gb/s (14.0 GB/s), both halves of the port at once 98.0 Gb/s each,
-196 Gb/s (24.5 GB/s) in total. A cable carries 24.5 GB/s per direction, a
-node sends 49 GB/s into the ring and receives 49 GB/s from it, and the
-81 GB/s above is a sum of halves that never overlapped; run together, the
-three cables would carry about 73 GB/s.
+196 Gb/s (24.5 GB/s) in total. A cable carries 24.5 GB/s per direction. A
+node is not worth two cables, though: both ports share the same two PCIe
+links, which together take 30.1 GB/s in and give 27.7 GB/s out (measured
+2026-11-13, section 14). The 81 GB/s above is a sum of halves that never
+overlapped; in ring order, where every node sends on one cable and receives
+on the other, the three cables would carry about 73 GB/s (not measured).
 
 Repeated after MTU 9000 (RoCE 4096) with `-s 1024 -n 10`: 13.37 to 13.44 GB/s
 average per cable, best 13.69 GB/s, receiver GPU verify 6.0 to 7.8 ms per
@@ -462,6 +466,7 @@ change little; they mainly cut per-packet overhead on the NIC.
 | `scripts/node-admin.sh` | the per-node root worker behind `ring-admin.sh`; also usable directly with `sudo`. |
 | `scripts/ring-mtu.sh` | non-interactive MTU variant for nodes that already have passwordless sudo. |
 | `scripts/ring-test.sh` | the GPU-fed RDMA test on every cable (above). |
+| `scripts/ring-gather.sh WORKER...` | run on the head: the other nodes' GPUs produce, all NIC paths carry, the head's GPU verifies (section 14). |
 | `scripts/ring-mok.sh keys\|build\|enroll\|load\|status NODE...` | Secure Boot across the ring: one Machine Owner Key created on the first node and copied to the others, `make clean modules tools` + `sign` + `install` on every node against its own kernel, the interactive `mokutil --import` (one-time password per node, then reboot and confirm in MokManager), and `modprobe` afterwards. |
 
 State on 2026-11-10 after running them: every node reaches every other with
@@ -677,7 +682,12 @@ boots apart: `tools/memlat 16` 115 ns per dependent load (128 ns with 4 KiB page
 `tools/memlat 0` 166 ns, and one core alone reads 33 GB/s (X925, cpu 16) or
 39 GB/s (A725, cpu 0) in `membw`, against 8.2 and 4.7 GB/s in section 12. A
 boot that shows 8 GB/s from one core is in the slow state; expect its
-latency to be several hundred ns.
+latency to be several hundred ns. The boot of 2026-11-13 was in the fast
+state again: 116 ns on cpu 16, 76 / 63 / 48 GB/s on cpus 16-19 and
+157 / 133 / 90 GB/s on all twenty. `memlat 0` read 240 ns on that boot with a
+desktop session and an idle `llama-server` on the housekeeping cores, so use
+an isolated core (16) as the reference. Two fast boots and one slow one so
+far.
 
 ### Experiments: done, and proposed
 
@@ -702,11 +712,14 @@ Alone, each half is PCIe-bound at the same 111.8 Gb/s to the fourth digit.
 Together they share the 200G port evenly and the sum is its line rate:
 `tx_bytes_phy` of `enp1s0f0np0` and `enP2p1s0f0np0` advanced by the same
 250 GB during the run, 25.0 GB/s on the wire with headers. So a cable is
-worth 24.5 GB/s per direction, a node can send 49 GB/s into the ring and
-take 49 GB/s out of it, and the per-half 13.6 GB/s figures in section 11
-become 12.3 GB/s whenever both halves of a port are busy. The engines'
-49 GB/s striped copy on this boot is exactly what one node can feed to both
-neighbours at once; the 5.3 GB/s of the slow state is a fifth of it.
+worth 24.5 GB/s per direction, and the per-half 13.6 GB/s figures in section
+11 become 12.3 GB/s whenever both halves of a port are busy. A node is not
+worth two cables: section 14 drives both ports at once and finds that the
+two PCIe links, not the ports, set the node's limit at 30.1 GB/s in and
+27.7 GB/s out. (An earlier version of this paragraph said 49 GB/s per node;
+that was inferred from one cable and is wrong.) The engines' 49 GB/s striped
+copy on this boot is more than the NIC can deliver or take; the 5.3 GB/s of
+the slow state is a fifth of the NIC's limit.
 
 Proposed, in order of expected payoff:
 
@@ -722,8 +735,9 @@ Proposed, in order of expected payoff:
    the port advertises `200G_2X,200G_4X,...` only. `mstlink -d <bdf>
    --speeds 400G_4X` on both ends of one cable (link drops while it
    retrains) would show whether the Spark's firmware/board allow it. The
-   second diagram labels the ports 200G, so expect "no"; the PCIe side would
-   remain the limit at 27 GB/s per node anyway.
+   second diagram labels the ports 200G, so expect "no". It would lift one
+   cable from 24.5 to at most 30 GB/s; a node fed by both neighbours is
+   already PCIe-bound (section 14) and would gain nothing.
 3. **GPU reads of a PCIe BAR through ATS.** `mmap` a BAR (`resource0` of a
    device whose registers are side-effect free to read, e.g. the NVMe
    controller's CAP/VS at offset 0), `cudaHostRegister(...,
@@ -745,3 +759,128 @@ Proposed, in order of expected payoff:
    (`IBV_ACCESS_ON_DEMAND`, implicit MRs) viable for "register nothing"
    RDMA into any process memory. Bandwidth will not change; registration
    cost and the NIC's behaviour under page migration will.
+
+## 14. Into the head: per-node ceilings and `ringgather` (2026-11-13)
+
+Section 13 measured one cable. This section asks what the two neighbours can
+deliver into one node at the same time, the head (DGX-1 here), and adds the
+function that does it.
+
+### The two PCIe links, not the two ports, limit a node
+
+Each PCIe x4 link of the ConnectX-7 carries *both* ports, so two 200G ports
+(400 Gb/s of line rate) sit behind two Gen5 x4 links. On the head both links
+train at 32 GT/s x4 with `MaxPayload 512` (the most either end supports),
+`MaxReadReq 512` and no AER errors; `pci=pcie_bus_safe` is on the command
+line.
+
+`ib_write_bw -s 1048576 -q 4 -D 12 -x 3`, servers on the head, clients started
+on the neighbours over ssh, every mix running at the same time. A and B are
+the head's PCIe links (`0000`, `0002`); 0 and 1 are its ports (to DGX-2 and
+to DGX-3). Gb/s of RDMA payload:
+
+| Flows into the head | Per flow | Total | Bound by |
+|---|---|---|---|
+| A0 | 111.9 | 111.9 (14.0 GB/s) | the sender's PCIe link |
+| A0 + B0, one cable, both halves | 98.0 each | 196.1 (24.5 GB/s) | the 200G port |
+| A1 + B1, the other cable | 98.0 each | 196.1 (24.5 GB/s) | the 200G port |
+| A0 + B1, two cables, one flow per link | 111.9 each | 223.7 (28.0 GB/s) | the senders' PCIe links |
+| A0 + A1, two cables into the same link | 60.3 each | 120.6 (15.1 GB/s) | one PCIe link of the head |
+| B0 + B1, same on the other link | 60.3 each | 120.6 (15.1 GB/s) | one PCIe link of the head |
+| **A0 + B0 + A1 + B1** | 60.3 each | **241.2 (30.15 GB/s)** | both PCIe links of the head |
+
+The head's `rx_bytes_phy` counters agree: 244.8 Gb/s on the wire for the
+four-flow mix, headers included. The other direction, head to neighbours
+(`--reversed`), is lower: 111.9 Gb/s from one link whether it feeds one port
+or two, 222 Gb/s (27.7 GB/s) from both.
+
+What this says:
+
+- **Into a node, one x4 link takes 120.6 Gb/s (15.1 GB/s)** no matter which
+  ports feed it. That is the link itself: Gen5 x4 carries 15.75 GB/s raw and
+  about 15.1 GB/s once every 512 bytes of payload has paid for its TLP
+  framing. Nothing in software is left to tune. Queue pairs (1, 4, 16) and
+  message size (64 KiB, 1 MiB, 8 MiB) all give 241 Gb/s.
+- **Out of a node, one link gives 111.9 Gb/s (14.0 GB/s).** The NIC has to
+  read host memory with requests of at most `MaxReadReq` = 512 bytes. Raising
+  that to 4096 is the one PCIe knob not yet tried; it could only help the
+  sending side.
+- **The most a node can receive is 30.15 GB/s, and only with four flows:**
+  both neighbours sending, each on both of its PCIe halves. One neighbour
+  alone delivers 24.5 GB/s (its cable). Two neighbours with one flow each
+  deliver 28.0 GB/s, because then each sender's single link is the limit.
+- 400G optics would not raise a node's total. They would only let one cable
+  reach what two already do.
+
+### `tools/ringgather`: the other two GB10s feeding the head
+
+`ringgather` is that four-flow pattern as a function. The head opens one RC
+connection per worker address, one address per link, and then per gather:
+
+1. it splits its destination buffer into one contiguous slice per link and
+   registers each slice on that link's RoCE device only;
+2. **FILL**: it asks every worker to produce its slice. The worker's GPU
+   writes the data into NIC-registered system memory and acks with the time
+   it took;
+3. **PUSH**: it tells every worker where its slice lives in the head's
+   memory (address and rkey). The workers RDMA-WRITE in 1 MiB chunks, 32 in
+   flight, the last one with an immediate;
+4. it returns when every slice has landed. The head's GPU then reads the
+   whole buffer straight from the NIC-written pages.
+
+The slices carry one continuous pattern over the whole destination, so a
+single verify kernel on the head proves that the GB10s together produced one
+coherent buffer. The reusable part is four functions in `tools/ringgather.c`:
+
+```c
+struct ring_gather *rg_open(char **worker_ips, int n, int port, int wait_s);
+int  rg_bind(struct ring_gather *g, void *dst, size_t len, size_t chunk);
+int  rg_gather(struct ring_gather *g, uint64_t seed, uint32_t iter, struct rg_stats *st);
+void rg_close(struct ring_gather *g);
+```
+
+On the worker, `produce()` is the one place where a real workload would put
+its own output instead of the test pattern; it is handed the registered
+staging buffer, so whatever the GPU writes there goes to the wire without a
+copy.
+
+```bash
+# from the head: discovers the shared subnets, copies the binary, starts the workers, gathers
+scripts/ring-gather.sh -s 4096 -n 5 DGX-2 DGX-3
+
+# by hand
+tools/ringgather --worker                                             # on DGX-2 and on DGX-3
+tools/ringgather 10.100.32.1 10.100.33.1 10.100.36.2 10.100.37.2      # on DGX-1
+```
+
+Results on 2026-11-13, GPU produce on the workers and GPU verify on the head:
+
+| Workers | Links | Gathered | Landed in the head | Head GPU verify |
+|---|---|---|---|---|
+| DGX-2 + DGX-3 | 4 | 5 x 4 GiB | 29.65 GB/s average (237 Gb/s), best 29.85 | 141 GB/s, all OK |
+| DGX-2 + DGX-3 | 4 | 3 x 16 GiB | 29.73 GB/s average (238 Gb/s), best 29.77 | 132 GB/s, all OK |
+| DGX-2 alone | 2 | 3 x 4 GiB | 24.45 GB/s (196 Gb/s) | 140 GB/s, all OK |
+| DGX-3 alone | 2 | 3 x 4 GiB | 24.45 GB/s (196 Gb/s) | all OK |
+
+With both neighbours every link runs at 59 to 62 Gb/s and the total is 98.5 %
+of the `ib_write_bw` ceiling above. One 16 GiB gather takes 76 ms to produce
+(each worker's GPU writes its 8 GiB at 114 GB/s), 578 ms on the wire and
+130 ms to verify on the head: the GPUs on both ends are four to five times
+faster than the NIC path, so the PCIe links are the only thing worth
+optimising around. The first gather after a connect is slower to produce
+(275 ms) because the workers allocate and register their staging memory
+then.
+
+Notes:
+
+- The slices are equal because the links are. To leave a neighbour out, do
+  not pass its addresses; the rest still gathers.
+- A worker serves any number of connections and sleeps while the head is
+  quiet. `-k N` makes it exit after N connections have closed and `-i secs`
+  after that long without one, which is how `ring-gather.sh` leaves nothing
+  running on the other nodes.
+- There is no authentication. A worker stages whatever size it is asked for
+  (up to 64 GiB) and writes to whatever address and rkey the head names, so
+  run it on the private ring only.
+- The opposite direction, the head scattering to both neighbours, is not
+  built; the outbound numbers above say it would top out at 27.7 GB/s.

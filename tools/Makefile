@@ -12,7 +12,7 @@ TARGETS = dmabctl membw memlat
 ifneq ($(and $(wildcard $(CUDA_HOME)/include/cuda.h),$(wildcard /usr/include/infiniband/verbs.h)),)
 TARGETS += rdma_dmabuf_check
 ifneq ($(wildcard /usr/include/rdma/rdma_cma.h),)
-TARGETS += ringbw
+TARGETS += ringbw ringgather
 endif
 endif
 ifneq ($(wildcard $(CUDA_HOME)/include/nvrtc.h),)
@@ -41,10 +41,13 @@ rdma_dmabuf_check: rdma_dmabuf_check.c
 ringbw: ringbw.c
 	$(CC) $(CFLAGS) -pthread -o $@ $< $(LDLIBS) $(NVRTC_FLAGS) -lrdmacm -libverbs
 
+ringgather: ringgather.c
+	$(CC) $(CFLAGS) -pthread -o $@ $< $(LDLIBS) $(NVRTC_FLAGS) -lrdmacm -libverbs
+
 gpuhostbw: gpuhostbw.cu
 	$(NVCC) -O2 -arch=$(GPUARCH) -o $@ $<
 
 clean:
-	rm -f dmabctl rdma_dmabuf_check ringbw membw gpuhostbw memlat
+	rm -f dmabctl rdma_dmabuf_check ringbw ringgather membw gpuhostbw memlat
 
 .PHONY: all clean

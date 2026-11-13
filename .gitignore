@@ -15,6 +15,7 @@ modules.order
 tools/dmabctl
 tools/rdma_dmabuf_check
 tools/ringbw
+tools/ringgather
 tools/membw
 tools/gpuhostbw
 tools/memlat
