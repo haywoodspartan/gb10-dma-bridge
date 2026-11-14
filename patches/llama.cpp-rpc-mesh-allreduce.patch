@@ -1,0 +1,1051 @@
+From d58b156b56fb146a97a95872b880243a3d4a55b1 Mon Sep 17 00:00:00 2001
+From: haywoodspartan <6591811+haywoodspartan@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 02:59:31 +0000
+Subject: [PATCH] rpc: mesh communicator, socket allreduce for any number of
+ servers
+
+Tensor parallelism over RPC reduced across servers only with a backend
+communicator (NCCL) or, without one, between exactly two servers over a
+star rooted at rank 0. The star also made every server reach rank 0 on
+the address the client uses for it, which is the wrong interface when
+each pair of servers has its own link.
+
+Add a mesh communicator: every rank holds a socket to every other rank,
+and the socket reduction covers any world size.
+
+- COMM_ADDRS: a server reports the IPv4 addresses of its interfaces,
+  with prefix length and link speed.
+- COMM_INIT_MESH: the client tells the higher rank of each pair where to
+  reach the lower one, picking an address on a subnet both report
+  (fastest link first, then the most specific subnet). Each link runs
+  the usual caps handshake, so it upgrades to RDMA on its own interface.
+- The reduction sends decode-sized partials to all peers before it
+  receives any, and exchanges larger ones with all peers at once, lower
+  rank first. Every rank adds the partials in rank order.
+- Servers advertise the feature in the former padding byte of the HELLO
+  response. The client uses the mesh only when every server has it, so
+  stock peers keep the star. GGML_RPC_NO_COMM_MESH forces the star.
+- Each rank logs where its reductions spent their time when the
+  communicator is freed.
+
+With two ranks the output is identical to the pairwise path. With three
+ranks perplexity is within 0.04% of the client-side fallback. On three
+DGX Spark nodes cabled as a ring, all three links come up on RDMA and a
+111B model generates 6.47 t/s on three ranks against 2.63 on one node.
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ ggml/src/ggml-rpc/ggml-rpc.cpp  | 647 ++++++++++++++++++++++++++++----
+ ggml/src/ggml-rpc/transport.cpp |  68 ++++
+ ggml/src/ggml-rpc/transport.h   |  13 +
+ 3 files changed, 664 insertions(+), 64 deletions(-)
+
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index d346bb12b..7b1ddb2f2 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -8,6 +8,7 @@
+ #include <array>
+ #include <chrono>
+ #include <cinttypes>
++#include <cstdio>
+ #include <optional>
+ #include <string>
+ #include <thread>
+@@ -78,6 +79,8 @@ enum rpc_cmd {
+     RPC_CMD_COMM_INIT,
+     RPC_CMD_COMM_ALLREDUCE,
+     RPC_CMD_COMM_FREE,
++    RPC_CMD_COMM_ADDRS,
++    RPC_CMD_COMM_INIT_MESH,
+     RPC_CMD_NONE,
+     RPC_CMD_COUNT,
+ };
+@@ -109,6 +112,8 @@ static const char * rpc_cmd_name(enum rpc_cmd cmd) {
+         case RPC_CMD_COMM_INIT:         return "COMM_INIT";
+         case RPC_CMD_COMM_ALLREDUCE:    return "COMM_ALLREDUCE";
+         case RPC_CMD_COMM_FREE:         return "COMM_FREE";
++        case RPC_CMD_COMM_ADDRS:        return "COMM_ADDRS";
++        case RPC_CMD_COMM_INIT_MESH:    return "COMM_INIT_MESH";
+         case RPC_CMD_NONE:              return "NONE";
+         default:                        return "UNKNOWN";
+     }
+@@ -125,11 +130,17 @@ struct rpc_msg_hello_req {
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+ };
+ 
++// Optional server features, advertised in rpc_msg_hello_rsp::features. The byte was padding
++// before, so a server that predates a feature reports it as absent.
++enum rpc_feature : uint8_t {
++    RPC_FEATURE_COMM_MESH = 1 << 0, // COMM_ADDRS and COMM_INIT_MESH: socket allreduce over any number of ranks
++};
++
+ struct rpc_msg_hello_rsp {
+     uint8_t major;
+     uint8_t minor;
+     uint8_t patch;
+-    uint8_t padding;
++    uint8_t features;
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+ };
+ 
+@@ -269,6 +280,35 @@ struct rpc_msg_comm_free_req {
+     uint32_t device;
+ };
+ 
++// Most ranks a mesh communicator holds, and most interface addresses a rank reports.
++#define RPC_COMM_MAX_RANKS 8
++#define RPC_COMM_MAX_ADDRS 16
++
++struct rpc_comm_addr {
++    uint8_t  addr[4];    // IPv4, network byte order
++    uint8_t  prefix;     // prefix length of its subnet
++    uint8_t  padding[3];
++    uint32_t speed;      // link speed in Mb/s, 0 when unknown
++};
++
++struct rpc_msg_comm_addrs_rsp {
++    uint32_t      n_addrs;
++    rpc_comm_addr addrs[RPC_COMM_MAX_ADDRS];
++};
++
++struct rpc_comm_peer {
++    char     host[64];
++    uint32_t port;
++};
++
++struct rpc_msg_comm_init_mesh_req {
++    uint32_t      device;
++    uint32_t      rank;
++    uint32_t      world;
++    uint32_t      port;                       // where this rank listens for the ranks above it
++    rpc_comm_peer lower[RPC_COMM_MAX_RANKS];  // lower[i] for i < rank: where to reach rank i
++};
++
+ #pragma pack(pop)
+ 
+ // RPC data structures
+@@ -423,7 +463,8 @@ static inline void rpc_cpu_relax() {
+ // Performs HELLO handshake with transport auto-negotiation.
+ // Advertises local capabilities via conn_caps; if the server responds with
+ // matching capabilities, the socket is upgraded transparently.
+-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
++// features receives the server's rpc_feature bits.
++static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, uint8_t & features) {
+     rpc_msg_hello_req request = {};
+     rpc_msg_hello_rsp response = {};
+ 
+@@ -439,6 +480,7 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+     }
+ 
+     sock->update_caps(response.conn_caps);
++    features = response.features;
+     LOG_DBG("[%s] handshake ok: server version %d.%d.%d, transport: %s\n",
+             __func__, response.major, response.minor, response.patch, sock->transport_name());
+     return true;
+@@ -516,6 +558,9 @@ public:
+     void start(const std::string & endpoint);
+     void work();
+ 
++    // whether the server advertised the given rpc_feature in its HELLO response
++    bool has_feature(rpc_feature feature) const { return (server_features & feature) != 0; }
++
+     ~rpc_dispatcher();
+ 
+ private:
+@@ -537,6 +582,7 @@ private:
+     std::unordered_map<uint32_t, std::unordered_set<uint64_t>> graph_uids;
+     rpc_msg_queue    queue;
+     socket_ptr       sock;
++    uint8_t          server_features = 0;
+     std::atomic_uint busy_spin_users = 0;
+     std::atomic_bool running;
+     std::thread      thread;
+@@ -652,7 +698,7 @@ void rpc_dispatcher::start(const std::string & endpoint) {
+     if (sock == nullptr) {
+         GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+     }
+-    if (!negotiate_hello(sock)) {
++    if (!negotiate_hello(sock, server_features)) {
+         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
+     }
+     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+@@ -1417,6 +1463,8 @@ public:
+     bool graph_compute(const std::vector<uint8_t> & input);
+     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+     bool comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_init_rsp & response);
++    void comm_addrs(rpc_msg_comm_addrs_rsp & response);
++    bool comm_init_mesh(const rpc_msg_comm_init_mesh_req & request, rpc_msg_comm_init_rsp & response);
+     bool comm_allreduce(const rpc_msg_comm_allreduce_req & request);
+     bool comm_free(const rpc_msg_comm_free_req & request);
+     bool init_tensor(const rpc_msg_init_tensor_req & request);
+@@ -1431,7 +1479,9 @@ public:
+ private:
+     void sync_all_backends();
+     void comm_free_device(uint32_t dev_id);
++    bool comm_select_reduction(uint32_t dev_id, ggml_backend_comm_allreduce_tensor_t socket_fn, const char * socket_name);
+     static bool comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tensors);
++    static bool comm_allreduce_mesh(void * comm_ctx_v, ggml_tensor ** tensors);
+     static bool comm_bootstrap_exchange(void * user_data, const void * send_buf, void * recv_buf, size_t size);
+     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
+     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
+@@ -1446,6 +1496,9 @@ private:
+         // Sockets to the other servers. Rank 0 holds one per peer in rank order, so peers[i] is
+         // rank i + 1. Every other rank holds one to rank 0. The pairwise path reduces over peers[0].
+         std::vector<socket_ptr> peers;
++        // Sockets of a mesh communicator, which uses these instead of peers: links[r] reaches
++        // rank r, and the entry for this rank itself is null.
++        std::vector<socket_ptr> links;
+         uint32_t                rank = 0;
+         uint32_t                world = 0;
+         ggml_backend_t          pairwise_backend = nullptr;
+@@ -1454,11 +1507,21 @@ private:
+         std::vector<uint8_t>    send_buf;
+         std::vector<uint8_t>    recv_buf;
+ 
+-        // The backend's communicator. Null on the pairwise path, which has none.
++        // Where the mesh reductions spent their time, logged when the communicator is freed:
++        // waiting for this rank's own partial, copying it off the device, exchanging with the
++        // peers (which includes waiting for theirs) and queueing the sum.
++        uint64_t n_reductions = 0;
++        uint64_t sent_bytes   = 0; // to each peer
++        double   wait_ms = 0;
++        double   pack_ms = 0;
++        double   wire_ms = 0;
++        double   sum_ms  = 0;
++
++        // The backend's communicator. Null on the pairwise and mesh paths, which have none.
+         void *                              backend_comm_ctx = nullptr;
+ 
+         // The chosen reduction, set once a path is agreed. Receives backend_comm_ctx, or
+-        // comm_state on the pairwise path. A communicator covers one device, so the caller
++        // comm_state on the pairwise and mesh paths. A communicator covers one device, so the caller
+         // passes a one-element tensor array.
+         ggml_backend_comm_allreduce_tensor_t allreduce_fn    = nullptr;
+     };
+@@ -1475,6 +1538,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+     response.major = RPC_PROTO_MAJOR_VERSION;
+     response.minor = RPC_PROTO_MINOR_VERSION;
+     response.patch = RPC_PROTO_PATCH_VERSION;
++    response.features = RPC_FEATURE_COMM_MESH;
+     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+ }
+ 
+@@ -2248,6 +2312,12 @@ void rpc_server::comm_free_device(uint32_t dev_id) {
+             comm_free(state.backend_comm_ctx);
+         }
+     }
++    if (state.n_reductions > 0) {
++        const double n = (double) state.n_reductions;
++        LOG_INFO("[%s] rank %u/%u: %" PRIu64 " reductions, %.1f MiB to each peer, mean ms: wait %.3f, pack %.3f, wire %.3f, sum %.3f\n",
++                 __func__, state.rank, state.world, state.n_reductions, (double) state.sent_bytes / (1024.0*1024.0),
++                 state.wait_ms / n, state.pack_ms / n, state.wire_ms / n, state.sum_ms / n);
++    }
+     state = comm_state();
+ }
+ 
+@@ -2335,7 +2405,23 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
+     state.rank  = request.rank;
+     state.world = request.world;
+ 
+-    // Forces the pairwise path, for comparing the two on one build. Setting it on any one rank
++    // Without a backend communicator the fallback is the pairwise exchange, which only covers two ranks.
++    if (!comm_select_reduction(dev_id, request.world == 2 ? comm_allreduce_pairwise : nullptr, "pairwise")) {
++        state.peers.clear();
++        return true;
++    }
++    response.ok = 1;
++    return true;
++}
++
++// Agrees with the other ranks of a connected communicator on how to reduce: with the backend's
++// own communicator when every rank has one, otherwise with socket_fn, which exchanges the partials
++// over the sockets (null when the sockets cannot serve this world size). Returns false when the
++// communicator cannot be used.
++bool rpc_server::comm_select_reduction(uint32_t dev_id, ggml_backend_comm_allreduce_tensor_t socket_fn, const char * socket_name) {
++    comm_state & state = comm_states[dev_id];
++
++    // Forces the socket path, for comparing the two on one build. Setting it on any one rank
+     // is enough, because the negotiation spreads the decision.
+     const bool no_backend_communicator = std::getenv("GGML_RPC_NO_BACKEND_COMMUNICATOR") != nullptr;
+ 
+@@ -2345,43 +2431,136 @@ bool rpc_server::comm_init(const rpc_msg_comm_init_req & request, rpc_msg_comm_i
+     auto allreduce_fn = (ggml_backend_comm_allreduce_tensor_t)
+         ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor");
+ 
+-    // The ranks must agree on backend communicator or pairwise. Every rank shares whether its
++    // The ranks must agree on backend communicator or sockets. Every rank shares whether its
+     // backend provides a communicator, and all ranks use it only if every rank can.
+     const uint8_t self_can_use_backend_comm = !no_backend_communicator && init_rank != nullptr && allreduce_fn != nullptr;
+-    std::vector<uint8_t> all_can_use_backend_comm(request.world);
++    std::vector<uint8_t> all_can_use_backend_comm(state.world);
+     if (!comm_bootstrap_exchange(&state, &self_can_use_backend_comm, all_can_use_backend_comm.data(),
+                                  sizeof(self_can_use_backend_comm))) {
+-        state.peers.clear();
+-        return true;
++        return false;
+     }
+     const bool use_backend_communicator = std::all_of(all_can_use_backend_comm.begin(), all_can_use_backend_comm.end(),
+                                                       [](uint8_t c) { return c != 0; });
+ 
+     if (use_backend_communicator) {
+-        void * backend_ctx = init_rank(backends[dev_id], (int) request.rank, (int) request.world, comm_bootstrap_exchange, &state);
++        void * backend_ctx = init_rank(backends[dev_id], (int) state.rank, (int) state.world, comm_bootstrap_exchange, &state);
+         if (backend_ctx == nullptr) {
+-            LOG_ERROR("[%s] failed to join communicator as rank %u/%u\n", __func__, request.rank, request.world);
+-            state.peers.clear();
+-            return true;
++            LOG_ERROR("[%s] failed to join communicator as rank %u/%u\n", __func__, state.rank, state.world);
++            return false;
+         }
+         state.backend_comm_ctx = backend_ctx;
+         state.allreduce_fn     = allreduce_fn;
+         // The sockets have done their job; the collective runs between the backends from here on.
+         state.peers.clear();
+-        LOG_INFO("[%s] device %u using backend communicator, rank %u/%u\n", __func__, dev_id, request.rank, request.world);
++        state.links.clear();
++        LOG_INFO("[%s] device %u using backend communicator, rank %u/%u\n", __func__, dev_id, state.rank, state.world);
++        return true;
++    }
++
++    if (socket_fn == nullptr) {
++        LOG_ERROR("[%s] world size %u requires a backend communicator\n", __func__, state.world);
++        return false;
++    }
++    state.pairwise_backend = backends[dev_id];
++    state.allreduce_fn     = socket_fn;
++    LOG_INFO("[%s] device %u using %s communicator, rank %u/%u\n", __func__, dev_id, socket_name, state.rank, state.world);
++    return true;
++}
++
++void rpc_server::comm_addrs(rpc_msg_comm_addrs_rsp & response) {
++    response = {};
++    rpc_local_addr local[RPC_COMM_MAX_ADDRS];
++    const size_t n = rpc_transport_local_addrs(local, RPC_COMM_MAX_ADDRS);
++    for (size_t i = 0; i < n; i++) {
++        memcpy(response.addrs[i].addr, local[i].addr, sizeof(response.addrs[i].addr));
++        response.addrs[i].prefix = local[i].prefix;
++        response.addrs[i].speed  = local[i].speed_mbps;
++    }
++    response.n_addrs = (uint32_t) n;
++}
++
++// Joins a mesh communicator: one socket to every other rank, so the reduction needs no backend
++// communicator at any world size. A rank listens for the ranks above it and connects to the
++// ranks below it, at the address the client picked for that pair (see comm_pick_host), so each
++// link can run over the interface the two servers share and get its own transport upgrade.
++bool rpc_server::comm_init_mesh(const rpc_msg_comm_init_mesh_req & request, rpc_msg_comm_init_rsp & response) {
++    response.ok = 0;
++    if (request.device >= backends.size() || request.world < 2 || request.world > RPC_COMM_MAX_RANKS ||
++        request.rank >= request.world) {
++        return true;
++    }
++    const uint32_t dev_id = request.device;
++    const uint32_t rank   = request.rank;
++    const uint32_t world  = request.world;
++    comm_state & state = comm_states[dev_id];
++    if (state.allreduce_fn != nullptr) {
+         response.ok = 1;
+         return true;
+     }
+ 
+-    // No backend communicator, so fall back to the pairwise exchange, which only covers two ranks.
+-    if (request.world != 2) {
+-        LOG_ERROR("[%s] world size %u requires a backend communicator\n", __func__, request.world);
+-        state.peers.clear();
++    // Joining a communicator blocks until every rank arrives, so drain outstanding work first.
++    sync_all_backends();
++
++    // Listen before connecting, so the ranks above can queue up while this one is still busy
++    // with the ranks below.
++    socket_ptr srv;
++    if (rank + 1 < world) {
++        srv = socket_t::create_server("0.0.0.0", request.port);
++        if (srv == nullptr) {
++            LOG_ERROR("[%s] failed to listen on comm port %u\n", __func__, request.port);
++            return true;
++        }
++    }
++
++    std::vector<socket_ptr> links(world);
++    for (uint32_t i = 0; i < rank; i++) {
++        const rpc_comm_peer & lower = request.lower[i];
++        const std::string host(lower.host, strnlen(lower.host, sizeof(lower.host)));
++        socket_ptr peer;
++        // the rank may not be listening yet, retry for a few seconds
++        for (int n = 0; n < 100 && peer == nullptr; n++) {
++            peer = socket_t::connect(host.c_str(), lower.port);
++            if (peer == nullptr) {
++                std::this_thread::sleep_for(std::chrono::milliseconds(50));
++            }
++        }
++        if (peer == nullptr) {
++            LOG_ERROR("[%s] rank %u failed to connect to rank %u at %s:%u\n", __func__, rank, i, host.c_str(), lower.port);
++            return true;
++        }
++        if (!comm_caps_handshake(peer, /*recv_first =*/ false) ||
++            !peer->send_data(&rank, sizeof(rank)) || !peer->flush()) {
++            LOG_ERROR("[%s] rank %u failed the handshake with rank %u at %s:%u\n", __func__, rank, i, host.c_str(), lower.port);
++            return true;
++        }
++        LOG_INFO("[%s] rank %u <-> rank %u via %s:%u, transport: %s\n", __func__, rank, i, host.c_str(), lower.port,
++                 peer->transport_name());
++        links[i] = std::move(peer);
++    }
++
++    // The ranks above connect in any order and say who they are. Each of them first works through
++    // the ranks below it, so allow for their connect retries before giving up.
++    const int accept_timeout_ms = 10000 + 5000 * (int) world;
++    for (uint32_t n = rank + 1; n < world; n++) {
++        socket_ptr peer = srv->accept(accept_timeout_ms);
++        uint32_t peer_rank = 0;
++        if (peer == nullptr || !comm_caps_handshake(peer, /*recv_first =*/ true) ||
++            !peer->recv_data(&peer_rank, sizeof(peer_rank)) ||
++            peer_rank <= rank || peer_rank >= world || links[peer_rank] != nullptr) {
++            LOG_ERROR("[%s] rank %u: bad or missing peer connection (rank %u)\n", __func__, rank, peer_rank);
++            return true;
++        }
++        links[peer_rank] = std::move(peer);
++    }
++
++    state.links = std::move(links);
++    state.rank  = rank;
++    state.world = world;
++
++    if (!comm_select_reduction(dev_id, comm_allreduce_mesh, "mesh")) {
++        state.links.clear();
+         return true;
+     }
+-    state.pairwise_backend = backends[dev_id];
+-    state.allreduce_fn     = comm_allreduce_pairwise;
+-    LOG_INFO("[%s] device %u using pairwise communicator, rank %u\n", __func__, dev_id, request.rank);
+     response.ok = 1;
+     return true;
+ }
+@@ -2394,22 +2573,31 @@ bool rpc_server::comm_bootstrap_exchange(void * user_data, const void * send_buf
+     uint8_t * recv = (uint8_t *) recv_buf;
+     const size_t total = (size_t) state.world * size;
+ 
++    // the socket to another rank: a mesh holds one per rank, the star only rank 0's spokes
++    const bool mesh = !state.links.empty();
++    auto link_to = [&](uint32_t r) -> socket_t * {
++        if (mesh) {
++            return state.links[r].get();
++        }
++        return state.rank == 0 ? state.peers[r - 1].get() : state.peers[0].get();
++    };
++
+     if (state.rank == 0) {
+         memcpy(recv, send_buf, size);
+-        for (size_t i = 0; i < state.peers.size(); i++) {
+-            if (!state.peers[i]->recv_data(recv + (i + 1) * size, size)) {
++        for (uint32_t r = 1; r < state.world; r++) {
++            if (!link_to(r)->recv_data(recv + r * size, size)) {
+                 return false;
+             }
+         }
+-        for (const socket_ptr & peer : state.peers) {
+-            if (!peer->send_data(recv, total) || !peer->flush()) {
++        for (uint32_t r = 1; r < state.world; r++) {
++            if (!link_to(r)->send_data(recv, total) || !link_to(r)->flush()) {
+                 return false;
+             }
+         }
+         return true;
+     }
+-    return state.peers[0]->send_data(send_buf, size) && state.peers[0]->flush() &&
+-           state.peers[0]->recv_data(recv, total);
++    return link_to(0)->send_data(send_buf, size) && link_to(0)->flush() &&
++           link_to(0)->recv_data(recv, total);
+ }
+ 
+ // Reduces this rank's contribution in place, exchanging partials with the peer over peers[0].
+@@ -2523,6 +2711,182 @@ bool rpc_server::comm_allreduce_pairwise(void * comm_ctx_v, ggml_tensor ** tenso
+     return true;
+ }
+ 
++// A mesh rank sends payloads up to this size to every peer before it receives any. They fit in
++// the buffers of every transport, so no rank can block in send while its peer does the same.
++static constexpr size_t RPC_COMM_EAGER_BYTES = 64 * 1024;
++
++// Reduces this rank's contribution in place, exchanging partials with every other rank over the
++// mesh links. Used when the backend provides no communicator. comm_ctx_v is the comm_state.
++bool rpc_server::comm_allreduce_mesh(void * comm_ctx_v, ggml_tensor ** tensors) {
++    comm_state & state = *(comm_state *) comm_ctx_v;
++    ggml_tensor * t_dst = tensors[0];
++    ggml_backend_t backend = state.pairwise_backend;
++
++    const uint32_t rank    = state.rank;
++    const uint32_t n_peers = state.world - 1;
++    // the peers are kept in rank order: slot k is for this rank
++    auto peer_rank = [&](uint32_t k) { return k < rank ? k : k + 1; };
++
++    const size_t  nbytes = ggml_nbytes(t_dst);
++    const int64_t ne     = ggml_nelements(t_dst);
++
++    const size_t max_nodes = 2*n_peers + 1;
++    size_t ctx_size = (4*n_peers + 8)*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(max_nodes, false);
++    struct ggml_init_params params = {
++        /*.mem_size   =*/ ctx_size,
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr ctx_ptr { ggml_init(params) };
++    GGML_ASSERT(ctx_ptr != nullptr);
++    ggml_context * ctx = ctx_ptr.get();
++
++    using clock = std::chrono::steady_clock;
++    auto ms_since = [](clock::time_point t) { return std::chrono::duration<double, std::milli>(clock::now() - t).count(); };
++    clock::time_point t_phase = clock::now();
++
++    // wait for the pending subgraph that produced this partial, and for the previous reduction,
++    // which may still be using the scratch buffer
++    ggml_backend_synchronize(backend);
++    state.wait_ms += ms_since(t_phase);
++    t_phase = clock::now();
++
++    // as on the pairwise path: large partials travel as bf16, small (decode-sized) ones stay f32
++    const bool   wire_bf16  = t_dst->type == GGML_TYPE_F32 && ne >= 32768;
++    const size_t wire_bytes = wire_bf16 ? (size_t) ne*2 : nbytes;
++    // scratch: one partial per peer in the type of t_dst, then with bf16 the outgoing wire copy
++    // and one incoming wire copy per peer
++    const size_t wire_base = (size_t) n_peers*nbytes;
++    const size_t need      = wire_bf16 ? wire_base + (size_t) (n_peers + 1)*wire_bytes : wire_base;
++    if (state.scratch_size < need) {
++        state.scratch.reset(ggml_backend_alloc_buffer(backend, need));
++        state.scratch_size = need;
++    }
++    char * scratch_base = (char *) ggml_backend_buffer_get_base(state.scratch.get());
++    state.send_buf.resize(wire_bytes);
++    state.recv_buf.resize((size_t) n_peers*wire_bytes);
++
++    auto new_scratch_tensor = [&](ggml_type type, size_t offset) {
++        ggml_tensor * t = ggml_new_tensor_4d(ctx, type, t_dst->ne[0], t_dst->ne[1], t_dst->ne[2], t_dst->ne[3]);
++        t->buffer = state.scratch.get();
++        t->data   = scratch_base + offset;
++        return t;
++    };
++    auto new_cpy_node = [&](ggml_tensor * src, ggml_tensor * dst) {
++        ggml_tensor * t = ggml_new_tensor_4d(ctx, dst->type, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
++        t->op     = GGML_OP_CPY;
++        t->src[0] = src;
++        t->src[1] = dst;
++        t->buffer = dst->buffer;
++        t->data   = dst->data;
++        t->flags |= GGML_TENSOR_FLAG_COMPUTE;
++        return t;
++    };
++    // dst += src, in place
++    auto new_add_node = [&](ggml_tensor * dst, ggml_tensor * src) {
++        ggml_tensor * t = ggml_new_tensor_4d(ctx, dst->type, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
++        t->op     = GGML_OP_ADD;
++        t->src[0] = dst;
++        t->src[1] = src;
++        t->buffer = dst->buffer;
++        t->data   = dst->data;
++        t->flags |= GGML_TENSOR_FLAG_COMPUTE;
++        return t;
++    };
++    auto compute_nodes = [&](const std::vector<ggml_tensor *> & nodes) {
++        ggml_cgraph * graph = ggml_new_graph_custom(ctx, max_nodes, false);
++        for (size_t i = 0; i < nodes.size(); i++) {
++            graph->nodes[i] = nodes[i];
++        }
++        graph->n_nodes = (int) nodes.size();
++        ggml_status status = ggml_backend_graph_compute_async(backend, graph);
++        GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
++    };
++
++    if (wire_bf16) {
++        ggml_tensor * t_wire_send = new_scratch_tensor(GGML_TYPE_BF16, wire_base);
++        compute_nodes({ new_cpy_node(t_dst, t_wire_send) });
++        ggml_backend_synchronize(backend);
++        ggml_backend_tensor_get(t_wire_send, state.send_buf.data(), 0, wire_bytes);
++    } else {
++        ggml_backend_tensor_get(t_dst, state.send_buf.data(), 0, wire_bytes);
++    }
++    state.pack_ms += ms_since(t_phase);
++    t_phase = clock::now();
++
++    const uint8_t * send = state.send_buf.data();
++    auto recv_slot = [&](uint32_t k) { return state.recv_buf.data() + (size_t) k*wire_bytes; };
++    // With one peer at a time, the lower rank sends first and the higher one receives first, so
++    // a payload of any size cannot deadlock.
++    auto exchange = [&](uint32_t k) -> bool {
++        socket_t * peer = state.links[peer_rank(k)].get();
++        if (rank < peer_rank(k)) {
++            return peer->send_data(send, wire_bytes) && peer->flush() && peer->recv_data(recv_slot(k), wire_bytes);
++        }
++        return peer->recv_data(recv_slot(k), wire_bytes) && peer->send_data(send, wire_bytes) && peer->flush();
++    };
++
++    bool ok = true;
++    if (n_peers == 1) {
++        ok = exchange(0);
++    } else if (wire_bytes <= RPC_COMM_EAGER_BYTES) {
++        for (uint32_t k = 0; k < n_peers && ok; k++) {
++            socket_t * peer = state.links[peer_rank(k)].get();
++            ok = peer->send_data(send, wire_bytes) && peer->flush();
++        }
++        for (uint32_t k = 0; k < n_peers && ok; k++) {
++            ok = state.links[peer_rank(k)]->recv_data(recv_slot(k), wire_bytes);
++        }
++    } else {
++        // too large to send blind: exchange with every peer at once, on a thread per extra peer
++        std::vector<std::future<bool>> extra;
++        for (uint32_t k = 1; k < n_peers; k++) {
++            extra.push_back(std::async(std::launch::async, exchange, k));
++        }
++        ok = exchange(0);
++        for (auto & f : extra) {
++            ok = f.get() && ok;
++        }
++    }
++    if (!ok) {
++        return false;
++    }
++    state.wire_ms += ms_since(t_phase);
++    t_phase = clock::now();
++
++    std::vector<ggml_tensor *> nodes;
++    std::vector<ggml_tensor *> t_part(n_peers);
++    for (uint32_t k = 0; k < n_peers; k++) {
++        t_part[k] = new_scratch_tensor(t_dst->type, (size_t) k*nbytes);
++        if (wire_bf16) {
++            ggml_tensor * t_wire_recv = new_scratch_tensor(GGML_TYPE_BF16, wire_base + (size_t) (k + 1)*wire_bytes);
++            ggml_backend_tensor_set(t_wire_recv, recv_slot(k), 0, wire_bytes);
++            nodes.push_back(new_cpy_node(t_wire_recv, t_part[k]));
++        } else {
++            ggml_backend_tensor_set(t_part[k], recv_slot(k), 0, wire_bytes);
++        }
++    }
++
++    // Add the partials in rank order on every rank, so that all of them round the same way. The
++    // running sum starts in the partial of rank 0 and moves into t_dst when this rank's own
++    // partial joins. The nodes work in place and run in the order listed.
++    ggml_tensor * t_acc = rank == 0 ? t_dst : t_part[0];
++    for (uint32_t r = 1; r < state.world; r++) {
++        ggml_tensor * t_next = r == rank ? t_dst : t_part[r < rank ? r : r - 1];
++        if (t_next == t_dst) {
++            nodes.push_back(new_add_node(t_dst, t_acc));
++            t_acc = t_dst;
++        } else {
++            nodes.push_back(new_add_node(t_acc, t_next));
++        }
++    }
++    compute_nodes(nodes);
++    state.sum_ms += ms_since(t_phase);
++    state.sent_bytes += wire_bytes;
++    state.n_reductions++;
++    return true;
++}
++
+ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
+     if (request.device >= backends.size()) {
+         return false;
+@@ -2905,6 +3269,31 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 }
+                 break;
+             }
++            case RPC_CMD_COMM_ADDRS: {
++                if (!recv_msg(sock, nullptr, 0)) {
++                    return;
++                }
++                rpc_msg_comm_addrs_rsp response;
++                server.comm_addrs(response);
++                if (!send_msg(sock, &response, sizeof(response))) {
++                    return;
++                }
++                break;
++            }
++            case RPC_CMD_COMM_INIT_MESH: {
++                rpc_msg_comm_init_mesh_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                rpc_msg_comm_init_rsp response;
++                if (!server.comm_init_mesh(request, response)) {
++                    return;
++                }
++                if (!send_msg(sock, &response, sizeof(response))) {
++                    return;
++                }
++                break;
++            }
+             case RPC_CMD_GET_DEVICE_MEMORY: {
+                 rpc_msg_get_device_memory_req request;
+                 if (!recv_msg(sock, &request, sizeof(request))) {
+@@ -3135,7 +3524,7 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
+     }
+ }
+ 
+-// Pairwise allreduce between two RPC servers over a direct server-to-server connection.
++// Allreduce between RPC servers over direct server-to-server connections.
+ // The client only sends fire-and-forget COMM_ALLREDUCE commands; the tensor data is
+ // exchanged between the servers and never passes through the client.
+ struct ggml_backend_rpc_comm_context {
+@@ -3161,77 +3550,207 @@ static void ggml_backend_rpc_comm_free(void * comm_ctx_v) {
+     delete comm_ctx;
+ }
+ 
+-static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_backends) {
+-    if (n_backends < 2 || std::getenv("GGML_RPC_NO_COMM") != nullptr) {
+-        return nullptr;
++using rpc_comm_ranks = std::vector<ggml_backend_rpc_comm_context::rank_info>;
++
++// Waits for the COMM_INIT or COMM_INIT_MESH responses of all ranks and reports the ones that failed.
++static bool ggml_backend_rpc_comm_init_wait(const rpc_comm_ranks & ranks, const std::vector<rpc_msg_comm_init_rsp> & responses) {
++    for (const auto & rank : ranks) {
++        rank.dispatcher->synchronize();
+     }
+-    std::vector<ggml_backend_rpc_comm_context::rank_info> ranks;
+-    ranks.reserve(n_backends);
+-    for (size_t i = 0; i < n_backends; i++) {
+-        if (!ggml_backend_is_rpc(backends[i])) {
+-            return nullptr;
+-        }
+-        ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backends[i]->context;
+-        // one rank per endpoint: a server processes its socket sequentially, so a second
+-        // COMM_INIT on the same connection would deadlock behind the first
+-        for (const auto & rank : ranks) {
+-            if (rank.endpoint == rpc_ctx->endpoint) {
+-                LOG_WARN("%s: multiple ranks on endpoint %s are not supported\n", __func__, rpc_ctx->endpoint.c_str());
+-                return nullptr;
+-            }
++    bool ok = true;
++    for (size_t i = 0; i < ranks.size(); i++) {
++        if (!responses[i].ok) {
++            LOG_WARN("%s: rank %zu (%s) failed to initialize\n", __func__, i, ranks[i].endpoint.c_str());
++            ok = false;
+         }
+-        ranks.push_back({rpc_ctx->endpoint, rpc_ctx->device, rpc_ctx->dispatcher});
+     }
++    return ok;
++}
+ 
++// Star: every rank connects to rank 0. Without a backend communicator on every server the
++// reduction over it is pairwise, which only covers two ranks.
++static bool ggml_backend_rpc_comm_init_star(const rpc_comm_ranks & ranks) {
+     // TODO: simplify this logic
+     // rank 1 connects to rank 0 on its serving host; endpoints must be mutually reachable
+     // (e.g. do not bind the servers to 127.0.0.1 when they run on different machines)
+     std::string host0;
+     int port0;
+     if (!parse_endpoint(ranks[0].endpoint, host0, port0)) {
+-        return nullptr;
++        return false;
+     }
+     const uint32_t comm_port = (uint32_t) port0 + 1000;
+     if (host0.size() >= 64) {
+-        return nullptr;
+-    }
+-
+-    for (const auto & rank : ranks) {
+-        rank.dispatcher->busy_spin_acquire();
++        return false;
+     }
+ 
+     // Send all init requests before reading any response: rank 0 blocks in accept
+     // until rank 1 has connected.
+-    std::vector<rpc_msg_comm_init_rsp> responses(n_backends);
+-    for (size_t i = 0; i < n_backends; i++) {
++    std::vector<rpc_msg_comm_init_rsp> responses(ranks.size());
++    for (size_t i = 0; i < ranks.size(); i++) {
+         auto request = std::make_shared<rpc_msg_comm_init_req>();
+         request->device = ranks[i].device;
+         request->rank   = (uint32_t) i;
+-        request->world  = (uint32_t) n_backends;
++        request->world  = (uint32_t) ranks.size();
+         request->port   = comm_port;
+         if (i > 0) {
+             memcpy(request->host, host0.c_str(), host0.size());
+         }
+         ranks[i].dispatcher->send_async(RPC_CMD_COMM_INIT, request, sizeof(*request), &responses[i], sizeof(responses[i]));
+     }
+-    for (size_t i = 0; i < n_backends; i++) {
+-        ranks[i].dispatcher->synchronize();
++    if (!ggml_backend_rpc_comm_init_wait(ranks, responses)) {
++        return false;
+     }
+-    bool ok = true;
++    LOG_INFO("%s: communicator initialized (%s <-> %s)\n", __func__,
++             ranks[0].endpoint.c_str(), ranks[1].endpoint.c_str());
++    return true;
++}
++
++// Picks the address of rank a that rank b connects to for their mesh link: one on a subnet both
++// report, so the link runs over an interface the two servers share and not over whichever one
++// faces the client. Among several, the fastest link wins, then the most specific subnet, then
++// the lowest address. Empty when the two share no subnet.
++static std::string comm_pick_host(const rpc_msg_comm_addrs_rsp & a, const rpc_msg_comm_addrs_rsp & b) {
++    auto host_order = [](const rpc_comm_addr & x) {
++        return ((uint32_t) x.addr[0] << 24) | ((uint32_t) x.addr[1] << 16) | ((uint32_t) x.addr[2] << 8) | (uint32_t) x.addr[3];
++    };
++    const uint32_t n_a = std::min<uint32_t>(a.n_addrs, RPC_COMM_MAX_ADDRS);
++    const uint32_t n_b = std::min<uint32_t>(b.n_addrs, RPC_COMM_MAX_ADDRS);
++
++    // Two servers on one host report the same addresses, and any of them works. Between hosts an
++    // address both report is no link: it is a local one that happens to repeat, like a default
++    // container bridge.
++    auto reports = [&](const rpc_msg_comm_addrs_rsp & r, uint32_t n, const rpc_comm_addr & x) {
++        for (uint32_t i = 0; i < n; i++) {
++            if (host_order(r.addrs[i]) == host_order(x)) {
++                return true;
++            }
++        }
++        return false;
++    };
++    bool same_host = n_a == n_b;
++    for (uint32_t i = 0; i < n_a && same_host; i++) {
++        same_host = reports(b, n_b, a.addrs[i]);
++    }
++
++    const rpc_comm_addr * best = nullptr;
++    uint32_t best_speed = 0;
++    for (uint32_t i = 0; i < n_a; i++) {
++        const rpc_comm_addr & x = a.addrs[i];
++        for (uint32_t j = 0; j < n_b; j++) {
++            const rpc_comm_addr & y = b.addrs[j];
++            if (x.prefix != y.prefix || x.prefix == 0 || x.prefix > 32) {
++                continue;
++            }
++            if (!same_host && host_order(x) == host_order(y)) {
++                continue;
++            }
++            const uint32_t mask = x.prefix == 32 ? 0xffffffffu : ~(0xffffffffu >> x.prefix);
++            if (((host_order(x) ^ host_order(y)) & mask) != 0) {
++                continue;
++            }
++            const uint32_t speed = std::min(x.speed, y.speed);
++            if (best == nullptr || speed > best_speed ||
++                (speed == best_speed && (x.prefix > best->prefix ||
++                                         (x.prefix == best->prefix && host_order(x) < host_order(*best))))) {
++                best       = &x;
++                best_speed = speed;
++            }
++        }
++    }
++    if (best == nullptr) {
++        return "";
++    }
++    char host[16];
++    snprintf(host, sizeof(host), "%u.%u.%u.%u", best->addr[0], best->addr[1], best->addr[2], best->addr[3]);
++    return host;
++}
++
++// Mesh: every rank gets a socket to every other rank, so the servers can reduce over sockets at
++// any world size. The client asks each rank for its interface addresses and tells the higher
++// rank of each pair where to reach the lower one.
++static bool ggml_backend_rpc_comm_init_mesh(const rpc_comm_ranks & ranks) {
++    const size_t n_ranks = ranks.size();
++    std::vector<std::string> hosts(n_ranks);
++    std::vector<int>         ports(n_ranks);
++    for (size_t i = 0; i < n_ranks; i++) {
++        if (!parse_endpoint(ranks[i].endpoint, hosts[i], ports[i]) || hosts[i].size() >= sizeof(rpc_comm_peer::host)) {
++            return false;
++        }
++    }
++
++    std::vector<rpc_msg_comm_addrs_rsp> addrs(n_ranks);
++    for (size_t i = 0; i < n_ranks; i++) {
++        ranks[i].dispatcher->send(RPC_CMD_COMM_ADDRS, nullptr, 0, &addrs[i], sizeof(addrs[i]));
++    }
++
++    // Send all init requests before reading any response: a rank blocks until the others arrive.
++    std::vector<rpc_msg_comm_init_rsp> responses(n_ranks);
++    for (size_t i = 0; i < n_ranks; i++) {
++        auto request = std::make_shared<rpc_msg_comm_init_mesh_req>();
++        request->device = ranks[i].device;
++        request->rank   = (uint32_t) i;
++        request->world  = (uint32_t) n_ranks;
++        // each rank listens next to its own endpoint, so ranks on one host do not collide
++        request->port   = (uint32_t) ports[i] + 1000;
++        for (size_t j = 0; j < i; j++) {
++            std::string host = comm_pick_host(addrs[j], addrs[i]);
++            if (host.empty()) {
++                // no shared subnet: try the host the client itself reaches rank j on
++                host = hosts[j];
++            }
++            memcpy(request->lower[j].host, host.c_str(), host.size());
++            request->lower[j].port = (uint32_t) ports[j] + 1000;
++            LOG_INFO("%s: rank %zu (%s) reaches rank %zu (%s) at %s:%u\n", __func__,
++                     i, ranks[i].endpoint.c_str(), j, ranks[j].endpoint.c_str(), host.c_str(), request->lower[j].port);
++        }
++        ranks[i].dispatcher->send_async(RPC_CMD_COMM_INIT_MESH, request, sizeof(*request), &responses[i], sizeof(responses[i]));
++    }
++    if (!ggml_backend_rpc_comm_init_wait(ranks, responses)) {
++        return false;
++    }
++    LOG_INFO("%s: communicator initialized (%zu ranks)\n", __func__, n_ranks);
++    return true;
++}
++
++static void * ggml_backend_rpc_comm_init(ggml_backend_t * backends, size_t n_backends) {
++    if (n_backends < 2 || std::getenv("GGML_RPC_NO_COMM") != nullptr) {
++        return nullptr;
++    }
++    rpc_comm_ranks ranks;
++    ranks.reserve(n_backends);
+     for (size_t i = 0; i < n_backends; i++) {
+-        if (!responses[i].ok) {
+-            LOG_WARN("%s: rank %zu (%s) failed to initialize\n", __func__, i, ranks[i].endpoint.c_str());
+-            ok = false;
++        if (!ggml_backend_is_rpc(backends[i])) {
++            return nullptr;
+         }
++        ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backends[i]->context;
++        // one rank per endpoint: a server processes its socket sequentially, so a second
++        // COMM_INIT on the same connection would deadlock behind the first
++        for (const auto & rank : ranks) {
++            if (rank.endpoint == rpc_ctx->endpoint) {
++                LOG_WARN("%s: multiple ranks on endpoint %s are not supported\n", __func__, rpc_ctx->endpoint.c_str());
++                return nullptr;
++            }
++        }
++        ranks.push_back({rpc_ctx->endpoint, rpc_ctx->device, rpc_ctx->dispatcher});
++    }
++
++    // The mesh needs every server to support it. GGML_RPC_NO_COMM_MESH forces the star, for
++    // comparing the two on one build.
++    const bool mesh = std::getenv("GGML_RPC_NO_COMM_MESH") == nullptr && n_backends <= RPC_COMM_MAX_RANKS &&
++        std::all_of(ranks.begin(), ranks.end(), [](const ggml_backend_rpc_comm_context::rank_info & rank) {
++            return rank.dispatcher->has_feature(RPC_FEATURE_COMM_MESH);
++        });
++
++    for (const auto & rank : ranks) {
++        rank.dispatcher->busy_spin_acquire();
+     }
++    const bool ok = mesh ? ggml_backend_rpc_comm_init_mesh(ranks) : ggml_backend_rpc_comm_init_star(ranks);
+     if (!ok) {
+         for (const auto & rank : ranks) {
+             rank.dispatcher->busy_spin_release();
+         }
+         return nullptr;
+     }
+-    LOG_INFO("%s: pairwise communicator initialized (%s <-> %s)\n", __func__,
+-             ranks[0].endpoint.c_str(), ranks[1].endpoint.c_str());
+     return new ggml_backend_rpc_comm_context{std::move(ranks)};
+ }
+ 
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index d5670f34d..ba3d898b8 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -16,7 +16,12 @@
+ #  include <netinet/tcp.h>
+ #  include <netdb.h>
+ #  include <unistd.h>
++#  include <ifaddrs.h>
++#  include <net/if.h>
++#  include <poll.h>
+ #endif
++#include <cerrno>
++#include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
+@@ -726,6 +731,23 @@ socket_ptr socket_t::accept() {
+     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+ }
+ 
++socket_ptr socket_t::accept(int timeout_ms) {
++#ifdef _WIN32
++    WSAPOLLFD pfd = { pimpl->fd, POLLRDNORM, 0 };
++    int r = WSAPoll(&pfd, 1, timeout_ms);
++#else
++    struct pollfd pfd = { pimpl->fd, POLLIN, 0 };
++    int r;
++    do {
++        r = poll(&pfd, 1, timeout_ms);
++    } while (r < 0 && errno == EINTR);
++#endif
++    if (r <= 0) {
++        return nullptr;
++    }
++    return accept();
++}
++
+ socket_ptr socket_t::create_server(const char * host, int port) {
+     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
+     if (!is_valid_fd(sockfd)) {
+@@ -812,3 +834,49 @@ void rpc_transport_shutdown() {
+     g_rpc_transport_wsa_started = false;
+ #endif
+ }
++
++size_t rpc_transport_local_addrs(rpc_local_addr * out, size_t max) {
++    size_t n = 0;
++#ifndef _WIN32
++    struct ifaddrs * list = nullptr;
++    if (getifaddrs(&list) != 0) {
++        return 0;
++    }
++    for (struct ifaddrs * ifa = list; ifa != nullptr && n < max; ifa = ifa->ifa_next) {
++        if (ifa->ifa_addr == nullptr || ifa->ifa_netmask == nullptr || ifa->ifa_addr->sa_family != AF_INET) {
++            continue;
++        }
++        if ((ifa->ifa_flags & IFF_UP) == 0 || (ifa->ifa_flags & IFF_LOOPBACK) != 0) {
++            continue;
++        }
++        const uint32_t addr = ((const struct sockaddr_in *) ifa->ifa_addr)->sin_addr.s_addr;
++        uint32_t       mask = ntohl(((const struct sockaddr_in *) ifa->ifa_netmask)->sin_addr.s_addr);
++
++        rpc_local_addr & a = out[n++];
++        memcpy(a.addr, &addr, sizeof(a.addr));
++        a.prefix = 0;
++        while (mask & 0x80000000u) {
++            a.prefix++;
++            mask <<= 1;
++        }
++        a.speed_mbps = 0;
++#  ifdef __linux__
++        // the link speed in Mb/s; virtual and wireless interfaces report none
++        char path[128];
++        snprintf(path, sizeof(path), "/sys/class/net/%s/speed", ifa->ifa_name);
++        if (FILE * f = fopen(path, "r")) {
++            long speed = 0;
++            if (fscanf(f, "%ld", &speed) == 1 && speed > 0) {
++                a.speed_mbps = (uint32_t) speed;
++            }
++            fclose(f);
++        }
++#  endif
++    }
++    freeifaddrs(list);
++#else
++    (void) out;
++    (void) max;
++#endif
++    return n;
++}
+diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
+index 59b8845c0..dc51f4bd1 100644
+--- a/ggml/src/ggml-rpc/transport.h
++++ b/ggml/src/ggml-rpc/transport.h
+@@ -21,6 +21,8 @@ struct socket_t {
+     bool flush();
+ 
+     socket_ptr accept();
++    // Like accept(), but gives up and returns nullptr when nobody connects within timeout_ms.
++    socket_ptr accept(int timeout_ms);
+ 
+     void get_caps(uint8_t * local_caps);
+     void update_caps(const uint8_t * remote_caps);
+@@ -37,3 +39,14 @@ private:
+ 
+ bool rpc_transport_init();
+ void rpc_transport_shutdown();
++
++// An IPv4 address on one of this host's interfaces.
++struct rpc_local_addr {
++    uint8_t  addr[4];     // network byte order
++    uint8_t  prefix;      // prefix length of its subnet
++    uint32_t speed_mbps;  // link speed, 0 when unknown
++};
++
++// Lists the addresses of the non-loopback interfaces that are up. Returns how many were written
++// to out (at most max, none on platforms without getifaddrs).
++size_t rpc_transport_local_addrs(rpc_local_addr * out, size_t max);
+-- 
+2.43.0
+

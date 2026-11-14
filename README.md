@@ -303,6 +303,7 @@ scripts/cluster-bootstrap.sh  passwordless sudo + full SSH mesh + project sync a
 scripts/ring-mok.sh     one MOK for the ring: create/copy, build+sign+install per node, enroll, load
 scripts/isolate-cores.sh   isolcpus/nohz_full/rcu_nocbs/irqaffinity via GRUB drop-in
 scripts/install.sh      MOK key setup, build, sign, install, load
+patches/llama.cpp-rpc-mesh-allreduce.patch  llama.cpp RPC backend: tensor mode across any number of nodes, each pair on its own cable (section 15)
 etc/                    modprobe, modules-load, udev
 Makefile, Kbuild, dkms.conf
 ```
@@ -884,3 +885,192 @@ Notes:
   run it on the private ring only.
 - The opposite direction, the head scattering to both neighbours, is not
   built; the outbound numbers above say it would top out at 27.7 GB/s.
+
+## 15. llama.cpp across the ring: layer split, tensor mode, three ranks (2026-11-13/14)
+
+Sections 13 and 14 measured the links. This section runs a model on them with
+llama.cpp (commit `e14a77971`, CUDA and RPC backends, RDMA transport built
+in) and adds a patch to its RPC backend,
+`patches/llama.cpp-rpc-mesh-allreduce.patch`, that lets all three GB10s work
+on every layer together.
+
+Two test models, both complete on the head's disk: gpt-oss 20B F16 (39 GiB,
+mixture of experts) and command-a 111B Q4_K_M (62.5 GiB, dense). All numbers
+are `llama-bench`, tokens per second, prompt of 512 tokens (pp512) and
+generation (tg128, tg64 for the 111B model).
+
+### Layer split adds memory, not speed
+
+`ggml-rpc-server` on DGX-2 and DGX-3, each bound to one ring address, and
+`--rpc 10.100.32.1:50052,10.100.37.2:50052` on the head. The transport
+upgrades itself to RDMA (RoCE v2) when the connection is made on a ring
+address; those two addresses sit on different PCIe halves of the head's NIC.
+The head then sees three devices with about 352 GiB free between them.
+
+| gpt-oss 20B, 2026-11-13 | pp512 | tg128 |
+|---|---|---|
+| head alone | 2174 | 26.6 |
+| head + DGX-2 + DGX-3, layer split (8 / 9 / 8 layers) | 2020 | 27.8 |
+
+The default split places layers by free memory, so the model is spread over
+all nodes without further flags. One GPU works at a time and a token passes
+through each in turn, so the cluster is as fast as one node and three times
+as large. The three-node run took about 50 s longer end to end than the
+head-only one, for 26.7 GiB placed on the children; llama.cpp's RDMA
+transport sends 256 KiB at a time, waits for each, and copies on both sides.
+Where those 50 s go was not profiled.
+
+### Tensor mode, and what stock llama.cpp allows
+
+`--split-mode tensor` (experimental upstream) gives every node a slice of
+every weight matrix. All nodes compute each half of a layer at the same time
+and then add their partial results together, a *reduction*, twice per layer.
+Over RPC that has three conditions in the stock code:
+
+- every rank is an RPC server, so the head serves its own GPU through a
+  `ggml-rpc-server` on `127.0.0.1` and the client uses RPC devices only;
+- without NCCL (not installed here) the servers reduce over a socket between
+  exactly two of them;
+- the second server reaches the first on the address the *client* uses for
+  it. On a ring with one subnet per cable that address is on the wrong
+  interface for any pair that does not include the head.
+
+Two ranks, head + DGX-2, stock code, 2026-11-13:
+
+| | pp512 | tg |
+|---|---|---|
+| gpt-oss 20B, layer split | 1978 | 27.7 |
+| gpt-oss 20B, tensor | 2399 | 40.4 |
+| command-a 111B, head alone | 241 | 2.63 |
+| command-a 111B, layer split | 256 | 2.98 |
+| command-a 111B, tensor | 301 | 4.94 |
+
+### The patch: a mesh communicator
+
+`patches/llama.cpp-rpc-mesh-allreduce.patch` (three files under
+`ggml/src/ggml-rpc`, +664 -64) removes the last two conditions:
+
+- **One socket per pair of ranks**, so the socket reduction works at any
+  number of ranks. A rank sends a generation-sized partial (11 KiB here) to
+  all peers and then receives; larger ones (prompt batches) are exchanged
+  with all peers at once, lower rank first, so nothing can deadlock.
+- **The link is chosen per pair.** Each server reports its interface
+  addresses with prefix and link speed, and the client tells the higher rank
+  of each pair to connect to an address on a subnet both have, fastest link
+  first. On this ring that is DGX-2 to the head on 10.100.32.2, DGX-3 to the
+  head on 10.100.36.1 and DGX-3 to DGX-2 on 10.100.34.1, each upgraded to
+  RDMA on its own cable. The order of the `--rpc` list no longer matters.
+- **Every rank adds the partials in rank order**, so all of them round the
+  same way.
+- **Stock peers keep working.** A patched server advertises the feature in a
+  byte of the handshake that was padding; the client uses the mesh only when
+  every server has it. `GGML_RPC_NO_COMM_MESH=1` forces the old path.
+- Each server logs where its reductions spent their time when the client
+  disconnects.
+
+```bash
+# on every node, with the patch file copied there: a separate worktree, so the
+# stock build stays as it is
+git -C ~/llama.cpp worktree add -b rpc-ring-allreduce ~/llama.cpp-ring e14a77971
+cd ~/llama.cpp-ring && git am ~/Documents/gb10-dma-bridge/patches/llama.cpp-rpc-mesh-allreduce.patch
+cmake -B build -DGGML_CUDA=ON -DGGML_RPC=ON -DLLAMA_CURL=OFF \
+      -DCMAKE_CUDA_ARCHITECTURES=121a-real -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target ggml-rpc-server llama-bench -j 14
+
+# one server per node, the head included
+~/llama.cpp-ring/build/bin/ggml-rpc-server -H 127.0.0.1   -p 50063     # DGX-1
+~/llama.cpp-ring/build/bin/ggml-rpc-server -H 10.100.32.1 -p 50062     # DGX-2
+~/llama.cpp-ring/build/bin/ggml-rpc-server -H 10.100.37.2 -p 50062     # DGX-3
+
+# on the head: all three ranks; -dev RPC1/RPC2 uses only the two children
+~/llama.cpp-ring/build/bin/llama-bench -m model.gguf -ngl 99 -fa on -sm tensor \
+    --rpc 127.0.0.1:50063,10.100.32.1:50062,10.100.37.2:50062 -dev RPC0/RPC1/RPC2
+```
+
+Checks, gpt-oss 20B, perplexity over eight 512-token chunks of this README,
+with all servers on the head's one GPU (the same code as between nodes):
+
+| | Perplexity |
+|---|---|
+| one GPU | 14.7172 |
+| two ranks, stock pairwise | 14.7180 |
+| two ranks, mesh | 14.7180, every chunk identical to stock |
+| three ranks, llama.cpp's client-side fallback (`GGML_RPC_NO_COMM=1`) | 14.6978 |
+| three ranks, mesh | 14.6924 |
+
+Greedy text from two ranks is identical between the stock path and the mesh,
+and three ranks on three nodes produce the same text as three servers on one
+node.
+
+### Results with the patch (2026-11-14)
+
+| Ranks (tensor mode where more than one) | gpt-oss 20B pp512 | tg128 | command-a 111B pp512 | tg64 |
+|---|---|---|---|---|
+| one node (head / DGX-2 / DGX-3) | 2148 / 2209 / 2209 | 25.8 / 32.0 / 30.8 | 241 (head) | 2.63 (head) |
+| head + DGX-2 | 2006 to 2046 | 30.8 to 31.2 | 301 (11-13) | 4.94 (11-13) |
+| **DGX-2 + DGX-3**, the head only runs the client | 2773 | **53.6** | 339 | 6.18 |
+| **all three** | 1689 to 2032 | 36.5 to 43.6 | 265 | **6.47** |
+
+On the same servers the stock pairwise path and the mesh give the same
+speed with two ranks (31.22 and 31.19). Numbers move by about 10 % between
+runs and between boots: head + DGX-2 gave 40.4 on 2026-11-13 and 31 to 35
+after the reboot of all three nodes on 2026-11-14.
+
+### Where a reduction spends its time
+
+Mean milliseconds per reduction, from the servers' own log lines. *wait* is
+the rank's own GPU finishing the partial, *pack* the copy off the device,
+*wire* the exchange including any wait for the other ranks, *sum* the copy
+back and the add.
+
+| Run | Rank | wait | pack | wire | sum |
+|---|---|---|---|---|---|
+| gpt-oss, all three | head | 0.220 | 0.099 | 0.016 | 0.052 |
+| | DGX-2 | 0.193 | 0.006 | 0.179 | 0.015 |
+| | DGX-3 | 0.199 | 0.006 | 0.174 | 0.015 |
+| gpt-oss, DGX-2 + DGX-3 | DGX-2 | 0.279 | 0.006 | 0.018 | 0.008 |
+| | DGX-3 | 0.286 | 0.006 | 0.011 | 0.008 |
+| command-a, all three | head | 0.825 | 0.124 | 0.030 | 0.095 |
+| | DGX-2 | 0.756 | 0.007 | 0.295 | 0.019 |
+| | DGX-3 | 0.764 | 0.007 | 0.288 | 0.019 |
+| command-a, DGX-2 + DGX-3 | DGX-2 | 1.114 | 0.007 | 0.028 | 0.010 |
+| | DGX-3 | 1.121 | 0.007 | 0.021 | 0.010 |
+
+What this says:
+
+- **The network is not the limit.** The rank that arrives last finds the
+  others' data waiting, so its *wire* is the true cost of the exchange: 11
+  to 30 microseconds out of 0.3 to 1.1 ms. gpt-oss makes 48 reductions per
+  token, each 11.3 KiB per link. Over 256 generated tokens the DGX-2 to
+  DGX-3 cable carried 138.8 MiB each way in 6.3 s, 22 MiB/s on a 200 Gb/s
+  link. More bandwidth, or more CPU cores moving data, would change nothing
+  here; pinning servers and client to the X925 cores did not either.
+- **The head is the slow rank.** Its small copies take 0.1 ms where the
+  children take 0.006 ms, and the children spend 0.17 to 0.29 ms of every
+  reduction waiting for it. The head's GPU also serves the remote desktop
+  (two `gnome-remote-desktop-daemon` compute contexts, `gnome-shell`,
+  `Xorg`), which is the likely cause; that was not verified. Keeping the
+  client process off the GPU made no difference.
+- **So the two children are the best pair**, 53.6 tokens/s on the 20B model
+  against 26 on the head alone, with the head only running the client. That
+  configuration needs the patch: the stock code cannot put the pair on their
+  own cable.
+- **A third rank pays when a token costs more GPU time.** On the 111B model
+  each rank's share drops from 1.11 to 0.76 ms per reduction and three ranks
+  reach 6.47 tokens/s, 2.5 times the head alone, even with the head holding
+  the others back. On the 20B model the head costs more than it adds.
+
+Notes:
+
+- Tensor mode needs flash attention and an unquantised KV cache, and
+  llama.cpp's automatic memory fit does not support it, so `-c` has to be
+  chosen by hand.
+- The RPC server has no authentication, and while a communicator is being
+  set up each rank listens on its port + 1000 on all interfaces. Private
+  ring only.
+- Not tested: more than three ranks, a mesh between hosts over plain TCP
+  (every link here was RDMA), NCCL, and any model that needs more than two
+  nodes' memory.
+- llama.cpp cannot yet combine the two modes, the children as a tensor pair
+  with the head taking whole layers of its own. For a model too large for
+  the pair, all three ranks in tensor mode is what there is.
